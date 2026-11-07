@@ -2932,6 +2932,35 @@ void spu_indirect_branch(spu_context* ctx)
                 if (PS3_LOG_FIRST(_unp, 8))
                     fprintf(stderr, "[spu] img=%d stub-return 0 from zeroed PIC buffer at LS 0x%05X (lr=0x%05X)\n",
                             ctx->image_id, p0, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+                /* PS3_CODEC_PROBE=1: dump the codec call ABI (notes 040).
+                 * Runs BEFORE the stub zeroes r3 -- the input cursor. */
+                /* PROBE-BEGIN */
+                { static int _probe = -1; if (_probe < 0) _probe = getenv("PS3_CODEC_PROBE") ? 1 : 0;
+                  if (_probe && p0 >= 0x1A900u && p0 < 0x21000u) {
+                    static int _pc = 0;
+                    if (_pc < 32) { _pc++;
+                      uint32_t pb = ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+                      uint32_t cur = ctx->gpr[3]._u32[0] & SPU_LS_MASK;
+                      int i; uint32_t a;
+                      fprintf(stderr, "[codec-probe] #%d img=%d entry=0x%05X lr=0x%05X r3=0x%X r4=0x%X r5=0x%X r6=0x%X r7=0x%X r8=0x%X r9=0x%X r10=0x%X r11=0x%X r12=0x%X r13=0x%X\n",
+                        _pc, ctx->image_id, p0, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                        ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0],
+                        ctx->gpr[7]._u32[0], ctx->gpr[8]._u32[0], ctx->gpr[9]._u32[0], ctx->gpr[10]._u32[0],
+                        ctx->gpr[11]._u32[0], ctx->gpr[12]._u32[0], ctx->gpr[13]._u32[0]);
+                      if (pb + 64 <= SPU_LS_SIZE) {
+                        fprintf(stderr, "[codec-probe] param:");
+                        for (i = 0; i < 16; i++) { a = pb + (uint32_t)i * 4u;
+                          fprintf(stderr, " %08X", ((uint32_t)ctx->ls[a] << 24) | ((uint32_t)ctx->ls[a+1] << 16) | ((uint32_t)ctx->ls[a+2] << 8) | (uint32_t)ctx->ls[a+3]); }
+                        fprintf(stderr, "\n");
+                      }
+                      if (cur + 32 <= SPU_LS_SIZE) {
+                        fprintf(stderr, "[codec-probe] input@r3:");
+                        for (i = 0; i < 32; i++) fprintf(stderr, " %02X", ctx->ls[cur + i]);
+                        fprintf(stderr, "\n");
+                      }
+                    }
+                  } }
+                /* PROBE-END */
                 ctx->gpr[3]._u32[0] = 0;
                 SPU_RET(ctx);
             }
