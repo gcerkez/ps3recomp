@@ -1074,19 +1074,26 @@ int rsx_draw_engine_blit(u32 src_loc, u32 src_off, u32 src_pitch,
     if (si == ENG_INVALID || g.surfaces[si].fmt != RSX_BE_FMT_R8G8B8A8 || (sxb & 3u))
         return 0;
 
-    /* Antialiased surfaces are held at sample resolution (aa_grid), but
-     * the guest's blit geometry is in logical pixels: a GPU blit would
-     * copy the matching rectangle of the sample grid instead of the
-     * logical image -- a quadrant crop for a 2x2 grid (Comet Crash's
-     * scene target). Decline and let the guest-memory path in
-     * cellGcmSys handle AA surfaces, as it did before this fast path. */
-    if ((g.surfaces[si].aa_grid & 0xFFu) > 1u || (g.surfaces[si].aa_grid >> 8) > 1u)
-        return 0;
+    /* AA-BLIT2 PATCH: antialiased sources are fine on the GPU path. The
+     * caller has already converted the guest's scale factors into a
+     * source rectangle in source texels (the sample grid), so the
+     * rectangle below is in sample units; what must not happen is
+     * clamping it against the surface's logical dims (that mix of units
+     * is what cropped the full-frame blit in the notes-035 incident) or
+     * filtering it linearly (the guest-memory path it replaces samples
+     * nearest). The destination side keeps its own AA decline below: a
+     * guest blit writes logical pixels, which has no per-sample-block
+     * equivalent on this path. */
+    u32 sgx = g.surfaces[si].aa_grid & 0xFFu;
+    u32 sgy = g.surfaces[si].aa_grid >> 8;
+    if (!sgx) sgx = 1;
+    if (!sgy) sgy = 1;
 
     u32 sx_surf = sxb / 4u;
-    if (sx_surf >= g.surfaces[si].w || sy_surf >= g.surfaces[si].h) return 0;
-    if (sx_surf + sw > g.surfaces[si].w) sw = g.surfaces[si].w - sx_surf;
-    if (sy_surf + sh > g.surfaces[si].h) sh = g.surfaces[si].h - sy_surf;
+    const u32 lim_w = g.surfaces[si].w * sgx, lim_h = g.surfaces[si].h * sgy;
+    if (sx_surf >= lim_w || sy_surf >= lim_h) return 0;
+    if (sx_surf + sw > lim_w) sw = lim_w - sx_surf;
+    if (sy_surf + sh > lim_h) sh = lim_h - sy_surf;
     if (!sw || !sh) return 0;
 
     /* Protect the source slot from LRU eviction if dst allocates a new slot. */
@@ -1142,7 +1149,7 @@ int rsx_draw_engine_blit(u32 src_loc, u32 src_off, u32 src_pitch,
     g.be->color_target_blit(g.be->user,
                             g.surfaces[si].handle, sx_surf, sy_surf, sw, sh,
                             g.surfaces[di].handle, dx_surf, dy_surf, dw, dh,
-                            linear);
+                            linear && sgx == 1u && sgy == 1u);
     g.surfaces[di].color_serial = ++g.write_serial;
     g.surfaces[di].guest_dirty  = 1;
     g.surfaces[di].last_use     = g.frames;
