@@ -196,9 +196,26 @@ s32 cellRescSetConvertAndFlip(void* con, s32 index)
      * rather than a plain scale. */
     extern s32 cellGcmSetFlipCommand(u32 bufferId);
     extern u32 cellGcm_display_buffer_count(void);
+    extern int cellGcm_get_display_buffer(u32 id, u32* offset, u32* pitch, u32* width, u32* height);
+    extern int rsx_draw_engine_blit(u32 src_loc, u32 src_off, u32 src_pitch,
+                                    u32 sx, u32 sy, u32 sw, u32 sh,
+                                    u32 dst_loc, u32 dst_off, u32 dst_pitch,
+                                    u32 dx, u32 dy, u32 dw, u32 dh, int linear);
     u32 nbuf = cellGcm_display_buffer_count();
     if (nbuf) {
-        cellGcmSetFlipCommand(s_flip_target % nbuf);
+        u32 target_id = s_flip_target % nbuf;
+        if (index >= 0 && index < 8 && s_src[index].width > 0 && s_src[index].height > 0) {
+            u32 dst_off = 0, dst_pitch = 0, dst_w = 0, dst_h = 0;
+            if (cellGcm_get_display_buffer(target_id, &dst_off, &dst_pitch, &dst_w, &dst_h)) {
+                if (s_src[index].offset != dst_off || s_src[index].width != dst_w || s_src[index].height != dst_h) {
+                    rsx_draw_engine_blit(0 /* LOCAL */, s_src[index].offset, s_src[index].pitch,
+                                         0, 0, s_src[index].width, s_src[index].height,
+                                         0 /* LOCAL */, dst_off, dst_pitch,
+                                         0, 0, dst_w, dst_h, 1 /* linear */);
+                }
+            }
+        }
+        cellGcmSetFlipCommand(target_id);
         s_flip_target = (u32)((s_flip_target + 1) % nbuf);
     }
 

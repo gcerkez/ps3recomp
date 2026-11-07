@@ -763,11 +763,16 @@ void cellGcmSetWaitFlip(void)
      * via cellGcmTickFlip, ~once per display refresh). This throttles the title
      * to vsync; without it the guest loops unthrottled and many frames batch
      * into a single host present -> the console text stacks/duplicates. */
+    extern void ppu_gcm_pump(void);
 #ifdef _WIN32
     __declspec(dllimport) void __stdcall Sleep(unsigned long);
 #endif  /* elsewhere: runtime/platform/win32_compat.h */
-    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++) {
+        ppu_gcm_pump();
+        if (s_flip_status != CELL_GCM_FLIP_STATUS_WAITING) break;
         Sleep(1);
+    }
+    ppu_gcm_pump();
     /* A flip still WAITING after the bound is left to the tick. Forcing DONE
      * here skipped its completion: the tick only completes WAITING flips, so
      * the flip handler never ran for it, and inFAMOUS 2, whose handler writes
@@ -3518,6 +3523,18 @@ int cellGcmOffsetIsDisplay(u32 offset)
 int cellGcm_current_scanout(u32* offset, u32* pitch, u32* width, u32* height)
 {
     const u32 id = s_current_display_buffer_id & 7u;
+    if (!s_display_buffer_set[id])
+        return 0;
+    if (offset) *offset = s_display_buffers[id].offset;
+    if (pitch)  *pitch  = s_display_buffers[id].pitch;
+    if (width)  *width  = s_display_buffers[id].width;
+    if (height) *height = s_display_buffers[id].height;
+    return 1;
+}
+
+int cellGcm_get_display_buffer(u32 id, u32* offset, u32* pitch, u32* width, u32* height)
+{
+    id = id & 7u;
     if (!s_display_buffer_set[id])
         return 0;
     if (offset) *offset = s_display_buffers[id].offset;

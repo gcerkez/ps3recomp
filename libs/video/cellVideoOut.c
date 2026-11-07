@@ -221,11 +221,15 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
     info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
     idx++;
 
-    /* 1080p */
-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_1080;
-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-    idx++;
+    const char* vres = getenv("PS3_VIDEO_RES");
+    int limit_720 = (vres && strcmp(vres, "720") == 0);
+    if (!limit_720) {
+        /* 1080p */
+        info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_1080;
+        info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+        info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+        idx++;
+    }
 
     info->availableModeCount = (u8)idx;
 
@@ -249,11 +253,26 @@ s32 cellVideoOutGetResolutionAvailability(u32 videoOut, u32 resolutionId,
                                           u32 aspect, u32 option)
 {
     (void)aspect; (void)option;
-    /* Stereoscopic 3D and dual-view modes have ids from 0x80 up (0x81 is 720p
-     * frame packing). Reporting them available tells the title a 3D TV is
-     * attached: MLB The Show 16 then asks to switch to 3D and, on yes, renders
-     * every frame twice, stacked over-under. No host display here is one. */
-    const s32 avail = (videoOut == CELL_VIDEO_OUT_PRIMARY && resolutionId < 0x80) ? 1 : 0;
+    if (videoOut != CELL_VIDEO_OUT_PRIMARY || resolutionId >= 0x80)
+        return 0;
+
+    static int s_limit_720 = -1;
+    if (s_limit_720 < 0) {
+        const char* e = getenv("PS3_VIDEO_RES");
+        s_limit_720 = (e && strcmp(e, "720") == 0) ? 1 : 0;
+    }
+    if (s_limit_720) {
+        if (resolutionId == CELL_VIDEO_OUT_RESOLUTION_1080 ||
+            resolutionId == CELL_VIDEO_OUT_RESOLUTION_1600x1080 ||
+            resolutionId == CELL_VIDEO_OUT_RESOLUTION_1440x1080 ||
+            resolutionId == CELL_VIDEO_OUT_RESOLUTION_1280x1080 ||
+            resolutionId == CELL_VIDEO_OUT_RESOLUTION_960x1080) {
+            printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u) -> 0 (capped at 720p)\n",
+                   videoOut, resolutionId);
+            return 0;
+        }
+    }
+    const s32 avail = 1;
     printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u) -> %d\n",
            videoOut, resolutionId, avail);
     return avail;

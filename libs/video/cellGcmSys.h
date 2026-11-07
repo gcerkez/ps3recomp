@@ -260,6 +260,7 @@ void cellGcm_syscall_set_fifo(u32 put, u32 get);
 /* Hand the display buffers the title has registered so far to the draw
  * engine, for an engine that comes up after cellGcmSetDisplayBuffer ran. */
 void cellGcm_replay_display_buffers_to_engine(void);
+int  cellGcm_get_display_buffer(u32 id, u32* offset, u32* pitch, u32* width, u32* height);
 
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height);
