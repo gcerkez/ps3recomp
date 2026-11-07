@@ -192,6 +192,8 @@ static int audio_backend_init(void)
         return -1;
     }
 
+    fprintf(stderr, "[cellAudio] SDL device: freq=%d ch=%d samples=%d format=0x%x\n",
+            have.freq, have.channels, have.samples, (unsigned)have.format);
     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
     return 0;
 }
@@ -228,6 +230,12 @@ static u32 audio_backend_queued_samples(void)
         return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float));
     }
     return 0;
+}
+
+/* Discard everything queued but not yet played (latency resync). */
+static void audio_backend_drop_backlog(void)
+{
+    if (s_sdl_audio_dev) SDL_ClearQueuedAudio(s_sdl_audio_dev);
 }
 
 #endif /* AUDIO_BACKEND_SDL2 */
@@ -684,6 +692,16 @@ static void* audio_mix_thread_func(void* arg)
     printf("[cellAudio] Mixing thread started\n");
 
     unsigned long blocks = 0; float peak = 0.0f;
+    /* Absolute pacing schedule (see the Windows thread): block k is
+     * due at t0 + k * (BLOCK_SAMPLES / SAMPLE_RATE). The previous
+     * usleep(2000/5000) heuristic had no reference clock, so the
+     * queue crept upward without bound and audio fell seconds
+     * behind the game. */
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    unsigned long long sched = 0; /* blocks mixed since t0 */
+    const long long block_ns =
+        1000000000LL * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE;
     while (s_mix_thread_running) {
         audio_mix_one_block();
         audio_dump_mix();
@@ -696,11 +714,29 @@ static void* audio_mix_thread_func(void* arg)
               if (++blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", blocks / 188, peak); peak = 0.0f; }
           } }
 
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
+        /* Resync instead of playing out a stale backlog: a queue
+         * past ~12 blocks (64 ms) or a schedule more than 50 ms
+         * behind the clock means the surplus can never be consumed
+         * in real time. */
+        sched++;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const long long now_ns = (long long)now.tv_sec * 1000000000LL + now.tv_nsec;
+        const long long t0_ns = (long long)t0.tv_sec * 1000000000LL + t0.tv_nsec;
+        const long long due_ns = t0_ns + (long long)sched * block_ns;
+        if (audio_backend_queued_samples() > CELL_AUDIO_BLOCK_SAMPLES * 12 ||
+            now_ns - due_ns > 50000000LL) {
+            audio_backend_drop_backlog();
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            sched = 0;
+            continue;
+        }
+        if (due_ns > now_ns) {
+            const long long wait_ns = due_ns - now_ns;
+            struct timespec ts;
+            ts.tv_sec = (time_t)(wait_ns / 1000000000LL);
+            ts.tv_nsec = (long)(wait_ns % 1000000000LL);
+            nanosleep(&ts, NULL);
         }
     }
 
@@ -867,6 +903,12 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     memset(&port->param, 0, sizeof(port->param));
     port->param.nChannel = nch;
     port->param.nBlock   = nblk;
+    {   /* level: big-endian float after the three u64 fields */
+        u32 bits = (u32)vm_read32(param_ea + 24);
+        float lv;
+        memcpy(&lv, &bits, sizeof(lv));
+        if (lv > 0.0f && lv <= 1.0f) port->param.level = lv;
+    }
     port->read_index  = 0;
     port->write_index = 0;
 
