@@ -301,7 +301,7 @@ static int pad_key_down(int key)
 #define PADKEY_TAB SDL_SCANCODE_TAB
 #endif
 
-static void pad_poll_keyboard(void)
+static void pad_poll_keyboard(int merge_only)
 {
     static int off = -1;
     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
@@ -309,12 +309,14 @@ static void pad_poll_keyboard(void)
 
     PadHostState* hs = &s_host_state[0];
     if (!pad_host_window_focused()) {
-        /* Release everything on focus loss, or a key held while alt-tabbing
-         * would stay down forever. */
-        hs->buttons = 0;
-        hs->analog_lx = hs->analog_ly = 128;
-        hs->analog_rx = hs->analog_ry = 128;
-        hs->connected = 1;
+        if (!merge_only) {
+            /* Release everything on focus loss, or a key held while alt-tabbing
+             * would stay down forever. */
+            hs->buttons = 0;
+            hs->analog_lx = hs->analog_ly = 128;
+            hs->analog_rx = hs->analog_ry = 128;
+            hs->connected = 1;
+        }
         return;
     }
 
@@ -331,6 +333,28 @@ static void pad_poll_keyboard(void)
     u16 btns = 0;
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
         if (pad_key_down(map[i].vk)) btns |= map[i].btn;
+
+    if (merge_only) {
+        if (!btns) return;
+        hs->buttons |= btns;
+        if (btns & CELL_PAD_CTRL_LEFT)  hs->analog_lx = 0;
+        if (btns & CELL_PAD_CTRL_RIGHT) hs->analog_lx = 255;
+        if (btns & CELL_PAD_CTRL_UP)    hs->analog_ly = 0;
+        if (btns & CELL_PAD_CTRL_DOWN)  hs->analog_ly = 255;
+        if (btns & CELL_PAD_CTRL_L2)    hs->trigger_l2 = 255;
+        if (btns & CELL_PAD_CTRL_R2)    hs->trigger_r2 = 255;
+        if (btns & CELL_PAD_CTRL_UP)       hs->press_up = 255;
+        if (btns & CELL_PAD_CTRL_DOWN)     hs->press_down = 255;
+        if (btns & CELL_PAD_CTRL_LEFT)     hs->press_left = 255;
+        if (btns & CELL_PAD_CTRL_RIGHT)    hs->press_right = 255;
+        if (btns & CELL_PAD_CTRL_TRIANGLE) hs->press_triangle = 255;
+        if (btns & CELL_PAD_CTRL_CIRCLE)   hs->press_circle = 255;
+        if (btns & CELL_PAD_CTRL_CROSS)    hs->press_cross = 255;
+        if (btns & CELL_PAD_CTRL_SQUARE)   hs->press_square = 255;
+        if (btns & CELL_PAD_CTRL_L1)       hs->press_l1 = 255;
+        if (btns & CELL_PAD_CTRL_R1)       hs->press_r1 = 255;
+        return;
+    }
 
     hs->buttons   = btns;
     hs->connected = 1;
@@ -793,7 +817,7 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    pad_poll_keyboard(s_host_state[0].connected);
     pad_track_assign();
     pad_unlock();
 }

@@ -25,6 +25,7 @@
 #  include <unistd.h>
 #  include <sys/types.h>
 #  include <sys/statvfs.h>
+#  include <execinfo.h>
 #  define HOST_MKDIR(p) mkdir(p, 0755)
 #  define HOST_STAT     stat
 #  define HOST_STAT_T   struct stat
@@ -853,6 +854,15 @@ s32 cellGameContentErrorDialog(s32 type, s32 errNeedSizeKB, const char* dirName)
 
     printf("[cellGame] *** ContentErrorDialog: %s (type=%d) dir='%s' needSizeKB=%d\n",
            what, type, dir, errNeedSizeKB);
+#ifndef _WIN32
+    void* callstack[32];
+    int frames = backtrace(callstack, 32);
+    char** strs = backtrace_symbols(callstack, frames);
+    for (int i = 0; i < frames; ++i) {
+        printf("[cellGame]   [%02d] %s\n", i, strs[i]);
+    }
+    free(strs);
+#endif
     if (type >= 100)
         printf("[cellGame] *** this is an EXIT dialog -- the title quits after this\n");
     fflush(stdout);

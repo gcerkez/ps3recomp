@@ -137,6 +137,11 @@ int64_t sys_fs_ftruncate(ppu_context* ctx);
 /* Registration */
 void sys_fs_init(lv2_syscall_table* tbl);
 
+/* Unified fd management across sys_fs and ppu_fs / cellFs */
+int   sys_fs_claim_fd(FILE* fp, const char* path, int flags);
+void  sys_fs_free_fd(int fd);
+FILE* sys_fs_get_fp(int fd);
+
 #ifdef __cplusplus
 }
 #endif

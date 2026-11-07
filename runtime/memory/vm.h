@@ -383,8 +383,11 @@ static inline uint32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size
     uint32_t base = sa->next_addr;
     sa->next_addr += total;
 
-    /* Guard page at the bottom (no access) */
-    vm_protect(base, pg, 0, 0, 0);
+    /* Guard page at the bottom: in flat VM mode where the full 4GB space is backed
+     * and accessible, PROT_NONE causes spurious SIGSEGV if guest accesses boundary.
+     * Leave writable or no-op. */
+    (void)base;
+    // vm_protect(base, pg, 0, 0, 0);
 
     return base + pg; /* skip the guard page */
 }

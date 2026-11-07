@@ -260,6 +260,11 @@ s32 cellPngDecOpen(CellPngDecMainHandle mainHandle,
                        (u32)sub->src.streamPtr, sub->src.streamSize);
             }
 
+            if (pngdec_load_source(sub) < 0) {
+                sub->in_use = 0;
+                return CELL_PNGDEC_ERROR_OPEN_FILE;
+            }
+
             vm_write32(subHandle_addr, i);
             if (openInfo_addr)
                 vm_write32(openInfo_addr + 0, 0);   /* initSpaceAllocated */

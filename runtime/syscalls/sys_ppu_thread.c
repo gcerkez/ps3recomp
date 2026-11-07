@@ -537,8 +537,11 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         *out = be_id;
     }
 
-    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d flags=0x%llX\n",
-            (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
+    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu (creator tid=%llu lr=0x%08llX) name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d flags=0x%llX\n",
+            (unsigned long long)thread_id,
+            (unsigned long long)ctx->thread_id,
+            (unsigned long long)ctx->lr,
+            t->name, (unsigned long long)entry, (unsigned long long)arg,
             stack_size, priority, (unsigned long long)flags);
     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
      * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null

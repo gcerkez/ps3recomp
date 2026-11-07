@@ -241,23 +241,47 @@ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir 
  * claim the same slot, and every handler reads its slot once (fd_file/fd_dir)
  * rather than re-reading a pointer another thread's close may have cleared. */
 static std::mutex g_fd_lock;
-static int fd_alloc_file(FILE* f)
+extern "C" int  sys_fs_claim_fd(FILE* fp, const char* path, int flags);
+extern "C" void sys_fs_free_fd(int fd);
+
+extern "C" void ppu_fs_set_file(int fd, FILE* f)
 {
-    std::lock_guard<std::mutex> hold(g_fd_lock);
-    for (int i = 3; i < FS_MAX; i++)
-        if (!g_files[i] && !g_dirs[i]) {
-            g_fd_dir[i] = 0;
-            __atomic_store_n(&g_files[i], f, __ATOMIC_RELEASE);
-            return i;
-        }
-    return -1;
+    if (fd >= 0 && fd < FS_MAX) {
+        std::lock_guard<std::mutex> hold(g_fd_lock);
+        g_fd_dir[fd] = 0;
+        __atomic_store_n(&g_files[fd], f, __ATOMIC_RELEASE);
+    }
 }
-static int fd_alloc_dir(DIR* d)
+
+extern "C" void ppu_fs_clear_file(int fd)
 {
+    if (fd >= 0 && fd < FS_MAX) {
+        std::lock_guard<std::mutex> hold(g_fd_lock);
+        __atomic_store_n(&g_files[fd], (FILE*)nullptr, __ATOMIC_RELEASE);
+    }
+}
+
+extern "C" FILE* ppu_fs_get_file(int fd)
+{
+    return (fd >= 0 && fd < FS_MAX) ? __atomic_load_n(&g_files[fd], __ATOMIC_ACQUIRE) : nullptr;
+}
+
+static int fd_alloc_file(FILE* f, const char* path = nullptr, int flags = 0)
+{
+    int fd = sys_fs_claim_fd(f, path, flags);
+    if (fd < 0 || fd >= FS_MAX) return -1;
+    ppu_fs_set_file(fd, f);
+    return fd;
+}
+
+static int fd_alloc_dir(DIR* d, const char* path = nullptr)
+{
+    int fd = sys_fs_claim_fd(nullptr, path, 0);
+    if (fd < 0 || fd >= FS_MAX) return -1;
     std::lock_guard<std::mutex> hold(g_fd_lock);
-    for (int i = 3; i < FS_MAX; i++)
-        if (!g_files[i] && !g_dirs[i]) { __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE); return i; }
-    return -1;
+    g_fd_dir[fd] = 1;
+    __atomic_store_n(&g_dirs[fd], d, __ATOMIC_RELEASE);
+    return fd;
 }
 static FILE* fd_file(int fd)
 {
@@ -323,7 +347,7 @@ static void cellFsOpen(ppu_context* ctx)
         close(hfd);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
     }
-    int fd = fd_alloc_file(f);
+    int fd = fd_alloc_file(f, gpath, flags);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
@@ -421,7 +445,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         }
         free(dec);
         rewind(tf);
-        int fd = fd_alloc_file(tf);
+        int fd = fd_alloc_file(tf, gpath, 0);
         if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
         if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
         fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
@@ -431,7 +455,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         ctx->gpr[3] = CELL_OK;
         return;
     }
-    int fd = fd_alloc_file(f);
+    int fd = fd_alloc_file(f, gpath, 0);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
@@ -452,6 +476,7 @@ static void cellFsClose(ppu_context* ctx)
             if (g_fd_usm[fd] && ps3_env_once("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
             __atomic_store_n(&g_files[fd], (FILE*)nullptr, __ATOMIC_RELEASE);
             g_fd_usm[fd] = 0; g_fd_dir[fd] = 0;
+            sys_fs_free_fd(fd);
         }
     }
     if (f) fclose(f);
@@ -754,7 +779,7 @@ static void cellFsOpendir(ppu_context* ctx)
     DIR* d = opendir(hpath);
     if (ps3_env_once("PS3_FSLOG")) fprintf(stderr, "[fs] opendir '%s' -> %s\n", gpath, d ? "OK" : "ENOENT");
     if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
-    int fd = fd_alloc_dir(d);
+    int fd = fd_alloc_dir(d, gpath);
     if (fd < 0) { closedir(d); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
     strncpy(g_dir_path[fd], hpath, sizeof g_dir_path[fd] - 1);
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
@@ -850,6 +875,7 @@ static void cellFsClosedir(ppu_context* ctx)
         std::lock_guard<std::mutex> hold(g_fd_lock);
         d = g_dirs[fd];
         __atomic_store_n(&g_dirs[fd], (DIR*)nullptr, __ATOMIC_RELEASE);
+        if (d) sys_fs_free_fd(fd);
     }
     if (d) closedir(d);
     ctx->gpr[3] = CELL_OK;

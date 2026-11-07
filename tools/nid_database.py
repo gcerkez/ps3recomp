@@ -278,6 +278,8 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellSpurs", "cellSpursKickJobChain"),
     ("cellSpurs", "cellSpursShutdownJobChain"),
     ("cellSpurs", "cellSpursRunJobChain"),
+    ("cellSpurs", "cellSpursAddUrgentCommand"),
+    ("cellSpurs", "cellSpursAddUrgentCall"),
     ("cellSpurs", "cellSpursGetJobPipelineInfo"),
     ("cellSpurs", "cellSpursGetJobChainInfo"),
     # SPURS Lock-Free Queue
@@ -410,6 +412,7 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellResc", "cellRescGcmSurface2RescSrc"),
     ("cellResc", "cellRescSetSrc"),
     ("cellResc", "cellRescSetConvertAndFlip"),
+    ("cellResc", "cellRescSetWaitFlip"),
 
     # ---- cellSysmodule ----
     ("cellSysmodule", "cellSysmoduleLoadModule"),

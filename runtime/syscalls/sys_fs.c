@@ -48,6 +48,65 @@ static void fs_slot_lock(void)   { pthread_mutex_lock(&s_fs_slot_lock); }
 static void fs_slot_unlock(void) { pthread_mutex_unlock(&s_fs_slot_lock); }
 #endif
 
+#ifdef __GNUC__
+__attribute__((weak)) void  ppu_fs_set_file(int fd, FILE* f) { (void)fd; (void)f; }
+__attribute__((weak)) void  ppu_fs_clear_file(int fd) { (void)fd; }
+__attribute__((weak)) FILE* ppu_fs_get_file(int fd) { (void)fd; return NULL; }
+#else
+void  ppu_fs_set_file(int fd, FILE* f);
+void  ppu_fs_clear_file(int fd);
+FILE* ppu_fs_get_file(int fd);
+#endif
+
+int sys_fs_claim_fd(FILE* fp, const char* path, int flags)
+{
+    fs_slot_lock();
+    int slot = -1;
+    for (int i = 0; i < SYS_FS_FD_MAX; i++) {
+        if (!g_sys_fs_fds[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        fs_slot_unlock();
+        return -1;
+    }
+    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
+    f->fp     = fp;
+    f->flags  = flags;
+    if (path) {
+        strncpy(f->path, path, sizeof(f->path) - 1);
+        f->path[sizeof(f->path) - 1] = '\0';
+    } else {
+        f->path[0] = '\0';
+    }
+    f->active = 1;     /* published last */
+    fs_slot_unlock();
+
+    int fd = slot + 3;
+    ppu_fs_set_file(fd, fp);
+    return fd;
+}
+
+void sys_fs_free_fd(int fd)
+{
+    int slot = fd - 3;
+    if (slot >= 0 && slot < SYS_FS_FD_MAX) {
+        fs_slot_lock();
+        g_sys_fs_fds[slot].fp = NULL;
+        g_sys_fs_fds[slot].active = 0;
+        fs_slot_unlock();
+
+        ppu_fs_clear_file(fd);
+    }
+}
+
+FILE* sys_fs_get_fp(int fd)
+{
+    int slot = fd - 3;
+    if (slot >= 0 && slot < SYS_FS_FD_MAX && g_sys_fs_fds[slot].active)
+        return g_sys_fs_fds[slot].fp;
+    return NULL;
+}
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
@@ -490,28 +549,14 @@ int64_t sys_fs_open(ppu_context* ctx)
     }
 
     /* Claim a free fd slot (see fs_slot_lock). A full table is EMFILE. */
-    fs_slot_lock();
-    int slot = -1;
-    for (int i = 0; i < SYS_FS_FD_MAX; i++) {
-        if (!g_sys_fs_fds[i].active) { slot = i; break; }
-    }
-    if (slot < 0) {
-        fs_slot_unlock();
+    int32_t fd = (int32_t)sys_fs_claim_fd(fp, host_path, flags);
+    if (fd < 0) {
         fclose(fp);
         return (int64_t)(int32_t)CELL_EMFILE;
     }
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    f->fp     = fp;
-    f->flags  = flags;
-    strncpy(f->path, host_path, sizeof(f->path) - 1);
-    f->path[sizeof(f->path) - 1] = '\0';
-    f->active = 1;     /* published last */
-    fs_slot_unlock();
 
-    fprintf(stderr, "[sys_fs] open OK: %s\n", host_path);
+    fprintf(stderr, "[sys_fs] open OK: %s (fd=%d)\n", host_path, fd);
 
-    /* FD is slot + 3 (reserve 0=stdin, 1=stdout, 2=stderr) */
-    int32_t fd = slot + 3;
     write_be32(fd_out, (uint32_t)fd);
 
     return CELL_OK;
@@ -537,8 +582,15 @@ int64_t sys_fs_read(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBADF;
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
-        return (int64_t)(int32_t)CELL_EBADF;
+    if (!f->active || !f->fp) {
+        FILE* pfp = ppu_fs_get_file(fd);
+        if (pfp) {
+            f->fp = pfp;
+            f->active = 1;
+        } else {
+            return (int64_t)(int32_t)CELL_EBADF;
+        }
+    }
 
     void* buf = vm_to_host(buf_addr);
     long pos_before = ftell(f->fp);
@@ -642,15 +694,19 @@ int64_t sys_fs_close(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBADF;
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active)
+    if (!f->active) {
+        FILE* pfp = ppu_fs_get_file(fd);
+        if (pfp) {
+            fclose(pfp);
+            sys_fs_free_fd(fd);
+            return CELL_OK;
+        }
         return (int64_t)(int32_t)CELL_EBADF;
+    }
 
     if (f->fp)
         fclose(f->fp);
-    fs_slot_lock();     /* hand the slot back once the stream is closed */
-    f->fp = NULL;
-    f->active = 0;
-    fs_slot_unlock();
+    sys_fs_free_fd(fd);
 
     return CELL_OK;
 }
@@ -681,9 +737,15 @@ int64_t sys_fs_lseek(ppu_context* ctx)
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
     if (!f->active || !f->fp) {
-        if (pos_addr)
-            write_be64(pos_addr, 0);
-        return 0;
+        FILE* pfp = ppu_fs_get_file(fd);
+        if (pfp) {
+            f->fp = pfp;
+            f->active = 1;
+        } else {
+            if (pos_addr)
+                write_be64(pos_addr, 0);
+            return 0;
+        }
     }
 
     int origin;
@@ -802,8 +864,15 @@ int64_t sys_fs_fstat(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBADF;
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
-        return (int64_t)(int32_t)CELL_EBADF;
+    if (!f->active || !f->fp) {
+        FILE* pfp = ppu_fs_get_file(fd);
+        if (pfp) {
+            f->fp = pfp;
+            f->active = 1;
+        } else {
+            return (int64_t)(int32_t)CELL_EBADF;
+        }
+    }
 
     struct stat st;
 #ifdef _WIN32

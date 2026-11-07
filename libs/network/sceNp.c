@@ -14,6 +14,7 @@
 #include "np_psnr.h"
 #include "../system/cellSysutil.h"
 #include "../filesystem/edat.h"
+#include "../filesystem/cellFs.h"
 
 
 /* ---------------------------------------------------------------------------
@@ -418,6 +419,19 @@ static s32 np_drm_is_available(const u8* k_licensee, const char* drm_path)
     /* A NULL klicensee is legal for content that needs none; nothing to record. */
     if (k) edat_add_klicensee(k);
     fprintf(stderr, "[sceNp] DRM availability check: %s\n", path ? path : "(null)");
+    if (path) {
+        char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
+        if (cellfs_translate_path(path, host_path, sizeof(host_path)) != 0) {
+            fprintf(stderr, "[sceNp] DRM path cannot be translated: %s\n", path);
+            return (s32)0x80029513; /* SCE_NP_DRM_ERROR_FILE_NOT_FOUND */
+        }
+        FILE* f = fopen(host_path, "rb");
+        if (!f) {
+            fprintf(stderr, "[sceNp] DRM file does not exist: %s (host: %s)\n", path, host_path);
+            return (s32)0x80029513; /* SCE_NP_DRM_ERROR_FILE_NOT_FOUND */
+        }
+        fclose(f);
+    }
     return CELL_OK;
 }
 

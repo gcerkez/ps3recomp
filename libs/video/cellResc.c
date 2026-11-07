@@ -175,8 +175,9 @@ s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts)
     return CELL_OK;
 }
 
-s32 cellRescSetConvertAndFlip(s32 index)
+s32 cellRescSetConvertAndFlip(void* con, s32 index)
 {
+    (void)con;
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
 
@@ -212,6 +213,14 @@ s32 cellRescSetConvertAndFlip(s32 index)
     if (s_flip_handler_opd)
         ps3_invoke_guest(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
 
+    return CELL_OK;
+}
+
+s32 cellRescSetWaitFlip(void* con)
+{
+    (void)con;
+    extern void cellGcmSetWaitFlip(void);
+    cellGcmSetWaitFlip();
     return CELL_OK;
 }
 

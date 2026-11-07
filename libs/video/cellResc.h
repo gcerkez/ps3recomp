@@ -99,7 +99,8 @@ s32 cellRescSetBufferAddress(void* colorBuf, void* vertexBuf, void* fragmentBuf)
 
 s32 cellRescSetSrc(s32 index, const CellRescSrc* src);
 s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts);
-s32 cellRescSetConvertAndFlip(s32 index);
+s32 cellRescSetConvertAndFlip(void* con, s32 index);
+s32 cellRescSetWaitFlip(void* con);
 
 s32 cellRescSetFlipHandler(void (*handler)(u32));
 s32 cellRescSetVBlankHandler(void (*handler)(u32));
