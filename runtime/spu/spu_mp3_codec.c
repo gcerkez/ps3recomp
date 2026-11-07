@@ -129,7 +129,17 @@ int ps3_spu_mp3_pic_invoke(spu_context *ctx, uint32_t entry)
     ls_wr32(ctx, param + 0x00, consumed);
 
     if (st->hold_bytes) {
-        memcpy(&ctx->ls[CODEC_OUT_LS], st->hold, (size_t)st->hold_bytes);
+        /* The real PIC is SPU code: its PCM in LS is big-endian.
+         * minimp3 hands us host-order int16, so byte-swap on the
+         * way into LS (v1 shipped them swapped the wrong way --
+         * the mixer pinned at full scale on byte-swapped samples). */
+        { uint8_t *dst = &ctx->ls[CODEC_OUT_LS];
+          int i, n = st->hold_bytes / 2;
+          for (i = 0; i < n; i++) {
+              uint16_t v = (uint16_t)st->hold[i];
+              dst[2 * i] = (uint8_t)(v >> 8);
+              dst[2 * i + 1] = (uint8_t)v;
+          } }
         ls_wr32(ctx, param + 0x10, (uint32_t)st->hold_bytes);
         ctx->gpr[3]._u32[0] = CODEC_OUT_LS;
         if (site_b) st->hold_bytes = 0;   /* site A peeks; site B takes */
