@@ -4196,14 +4196,40 @@ void rsx_vulkan_backend_shutdown(void)
     memset(&s_vk, 0, sizeof s_vk);
 }
 
+/* A title may ask for confirmation before a window quit (close button
+ * or Escape) is honoured -- e.g. so a run in progress is not lost to a
+ * stray keypress. The title defines ps3_host_quit_needs_confirm() to
+ * return nonzero when quitting would lose something; it is a weak
+ * symbol, so titles that do not define it keep the historical
+ * quit-immediately behaviour. */
+extern int ps3_host_quit_needs_confirm(void) __attribute__((weak));
+
+static int vk_quit_confirmed(void)
+{
+    if (!ps3_host_quit_needs_confirm || !ps3_host_quit_needs_confirm())
+        return 1;
+    const SDL_MessageBoxButtonData buttons[] = {
+        { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Keep playing" },
+        { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Quit" },
+    };
+    const SDL_MessageBoxData box = {
+        SDL_MESSAGEBOX_WARNING, s_vk.window, "Quit?",
+        "Quit now? Progress in the current session will be lost.",
+        2, buttons, NULL
+    };
+    int button = -1;
+    if (SDL_ShowMessageBox(&box, &button) != 0) return 1;  /* cannot ask: do not trap the user */
+    return button == 1;
+}
+
 int rsx_vulkan_backend_pump_messages(void)
 {
     if (!s_vk.windowed) return 0;
     int quit = 0;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_QUIT) quit = 1;
-        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+        if (e.type == SDL_QUIT) { if (vk_quit_confirmed()) quit = 1; }
+        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) { if (vk_quit_confirmed()) quit = 1; }
         else if (e.type == SDL_KEYDOWN && !e.key.repeat && s_vk.window &&
                  (e.key.keysym.sym == SDLK_F11 ||
                   (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
