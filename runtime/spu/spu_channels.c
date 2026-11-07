@@ -2925,6 +2925,13 @@ void spu_indirect_branch(spu_context* ctx)
             uint32_t w = ((uint32_t)ctx->ls[p0] << 24) | ((uint32_t)ctx->ls[p0+1] << 16) |
                          ((uint32_t)ctx->ls[p0+2] << 8) | ctx->ls[p0+3];
             if (w == 0u && p0 >= 0x1000u && p0 < 0x3E000u && ctx->host_depth > 0) {
+                /* Host MP3 codec (notes 039/040): MultiStream's codec
+                 * entry range is serviced natively -- no firmware. */
+                if (p0 >= 0x1A900u && p0 < 0x21000u) {
+                    extern int ps3_spu_mp3_pic_invoke(spu_context *ctx, uint32_t entry);
+                    if (ps3_spu_mp3_pic_invoke(ctx, p0))
+                        SPU_RET(ctx);
+                }
                 /* Unloaded external PIC plugin buffer (e.g. MultiStream calling
                  * /dev_flash/sys/external/flashMP3.pic): return 0 to the caller
                  * instead of treating zeroed buffer bytes as a fatal exit. */
