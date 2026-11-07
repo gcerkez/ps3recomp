@@ -395,6 +395,33 @@ static void pad_poll_keyboard(int merge_only)
           fflush(stdout); } }
 }
 
+/* Right-stick range boost. A DualShock 3 saturates: pushed to the rim it
+ * reports the byte extremes (corners included), and titles tuned on it put
+ * their hard-tilt gates near full scale -- Comet Crash's unit-send commit
+ * needs a converted magnitude over 0.9, i.e. raw bytes of ~246+. SDL and
+ * XInput report a modern pad's circular gate honestly, so a full tilt
+ * lands at ~218-245 and such gates are marginal or unreachable: the menu
+ * engages, the lock never sets. Stretching the right stick's deflection
+ * about the centre (default x1.25, clamped) restores the DS3's rim
+ * behaviour; the centre and the converters' deadzones are untouched, and
+ * the left stick is left alone (the guest clamps its length itself).
+ * PAD_STICK_BOOST overrides the gain (1.0 = off). */
+static u8 pad_boost_right_axis(u8 v)
+{
+    static float s_boost = -1.0f;
+    if (s_boost < 0.0f) {
+        const char* e = getenv("PAD_STICK_BOOST");
+        s_boost = e ? (float)atof(e) : 1.25f;
+        if (s_boost < 1.0f) s_boost = 1.0f;
+        if (s_boost > 2.0f) s_boost = 2.0f;
+    }
+    int o = 128 + (int)((float)((int)v - 128) * s_boost);
+    if (o < 0) o = 0;
+    if (o > 255) o = 255;
+    return (u8)o;
+}
+
+
 /* ---------------------------------------------------------------------------
  * XInput backend
  * -----------------------------------------------------------------------*/
@@ -403,6 +430,7 @@ static void pad_poll_keyboard(int merge_only)
 
 /* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
 #define PAD_STICK_DEADZONE  7849
+
 #define PAD_TRIGGER_THRESHOLD 30
 
 /* XInput is resolved at run time. Only XInputGetState and XInputSetState are
@@ -515,8 +543,8 @@ static void pad_poll_xinput(void)
          * (via sagemono, PR #42) */
         s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
         s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE));
-        s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, PAD_STICK_DEADZONE);
-        s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
+        s_host_state[i].analog_rx = pad_boost_right_axis(pad_xinput_stick_to_u8(gp->sThumbRX, PAD_STICK_DEADZONE));
+        s_host_state[i].analog_ry = pad_boost_right_axis((u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE)));
 
         /* Triggers */
         s_host_state[i].trigger_l2 = gp->bLeftTrigger;
@@ -773,8 +801,8 @@ static void pad_poll_sdl2(void)
         /* Analog sticks */
         s_host_state[i].analog_lx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX));
         s_host_state[i].analog_ly = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY));
-        s_host_state[i].analog_rx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX));
-        s_host_state[i].analog_ry = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY));
+        s_host_state[i].analog_rx = pad_boost_right_axis(pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX)));
+        s_host_state[i].analog_ry = pad_boost_right_axis(pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY)));
 
         /* Triggers */
         s_host_state[i].trigger_l2 = pad_sdl_trigger_to_u8(lt);
