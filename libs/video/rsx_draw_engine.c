@@ -3483,29 +3483,26 @@ static void sink_end(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
-    static int s_vp_logged = 0;
     static int s_vp_env = -1;
-    if (s_vp_env < 0) s_vp_env = getenv("PS3RECOMP_VP_DIAG") ? 1 : 0;
-    if (s_vp_env && s_vp_logged < 20) {
-        s_vp_logged++;
-        fprintf(stderr, "[RSX_VP_MATH #%d] clip=%ux%u aa=%ux%u surf=%ux%u g=%ux%u trans=(%.1f,%.1f) scale=(%.1f,%.1f) -> xf=(%.4f,%.4f, offset=%.4f,%.4f)\n",
-               s_vp_logged, sf.clip_w, sf.clip_h, sf.aa_sx, sf.aa_sy,
-               target < g.n_surfaces ? g.surfaces[target].w : 0,
-               target < g.n_surfaces ? g.surfaces[target].h : 0,
-               g.width, g.height,
-               vp.translate[0], vp.translate[1],
-               vp.scale[0], vp.scale[1],
-               xf[0], xf[1], xf[4], xf[5]);
-    }
-    if (s_vp_env && (fabsf(xf[4]) > 0.01f || fabsf(xf[5]) > 0.01f || fabsf(xf[0] - 1.0f) > 0.01f)) {
-        static int s_vp_shifted = 0;
-        if (s_vp_shifted < 20) {
-            s_vp_shifted++;
-            fprintf(stderr, "[RSX_VP_SHIFTED #%d] clip=%ux%u surf=%ux%u g=%ux%u trans=(%.1f,%.1f) scale=(%.1f,%.1f) -> xf=(%.4f,%.4f, offset=%.4f,%.4f)\n",
-                   s_vp_shifted, sf.clip_w, sf.clip_h,
+    if (s_vp_env < 0) s_vp_env = getenv("PS3RECOMP_VP_DIAG") ? atoi(getenv("PS3RECOMP_VP_DIAG")) : 0;
+    if (s_vp_env) {
+        static u32 s_last_frame = 0;
+        static float s_last_xf0 = 0, s_last_xf4 = 0;
+        static u32 s_last_target = 0xFFFFFFFF;
+        if (g.frames != s_last_frame && (g.frames % 60 == 0 || target != s_last_target || fabsf(xf[0] - s_last_xf0) > 0.01f || fabsf(xf[4] - s_last_xf4) > 0.01f)) {
+            s_last_frame = g.frames;
+            s_last_xf0 = xf[0];
+            s_last_xf4 = xf[4];
+            s_last_target = target;
+            u32 sc[4] = {0};
+            eng_scissor_rect(&sf, target < g.n_surfaces ? g.surfaces[target].w : g.width,
+                             target < g.n_surfaces ? g.surfaces[target].h : g.height, sc);
+            fprintf(stderr, "[RSX_VP] frame %u: target=%u surf=%ux%u clip=(%u,%u %ux%u) sc=(%u,%u %ux%u) trans=(%.1f,%.1f) scale=(%.1f,%.1f) -> xf=(%.4f,%.4f, offset=%.4f,%.4f)\n",
+                   g.frames, target,
                    target < g.n_surfaces ? g.surfaces[target].w : 0,
                    target < g.n_surfaces ? g.surfaces[target].h : 0,
-                   g.width, g.height,
+                   sf.clip_x, sf.clip_y, sf.clip_w, sf.clip_h,
+                   sc[0], sc[1], sc[2], sc[3],
                    vp.translate[0], vp.translate[1],
                    vp.scale[0], vp.scale[1],
                    xf[0], xf[1], xf[4], xf[5]);
@@ -3754,6 +3751,14 @@ static void eng_present(u32 buffer_id)
     }
     pd_present(target);
     g.last_present_surface = target;
+    if (getenv("PS3RECOMP_VP_DIAG")) {
+        static u32 s_pres_count = 0;
+        if (s_pres_count++ % 60 == 0) {
+            fprintf(stderr, "[RSX_PRESENT] frame %u: buf_id=%u target_surf=%u (off=0x%08X %ux%u) guest_draws=%u total_surfs=%u\n",
+                    g.frames, buffer_id, target, g.surfaces[target].offset, g.surfaces[target].w, g.surfaces[target].h,
+                    g.guest_draws, g.n_surfaces);
+        }
+    }
     g.be->present(g.be->user, g.surfaces[target].handle);
     g.frames++;
     g.last_guest_draws = g.guest_draws;

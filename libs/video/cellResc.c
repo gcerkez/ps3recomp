@@ -204,16 +204,30 @@ s32 cellRescSetConvertAndFlip(void* con, s32 index)
     u32 nbuf = cellGcm_display_buffer_count();
     if (nbuf) {
         u32 target_id = s_flip_target % nbuf;
+        int did_blit = 0;
+        u32 dst_off = 0, dst_pitch = 0, dst_w = 0, dst_h = 0;
         if (index >= 0 && index < 8 && s_src[index].width > 0 && s_src[index].height > 0) {
-            u32 dst_off = 0, dst_pitch = 0, dst_w = 0, dst_h = 0;
             if (cellGcm_get_display_buffer(target_id, &dst_off, &dst_pitch, &dst_w, &dst_h)) {
                 if (s_src[index].offset != dst_off || s_src[index].width != dst_w || s_src[index].height != dst_h) {
+                    did_blit = 1;
                     rsx_draw_engine_blit(0 /* LOCAL */, s_src[index].offset, s_src[index].pitch,
                                          0, 0, s_src[index].width, s_src[index].height,
                                          0 /* LOCAL */, dst_off, dst_pitch,
                                          0, 0, dst_w, dst_h, 1 /* linear */);
                 }
             }
+        }
+        static u32 s_resc_logged = 0;
+        if (s_resc_logged < 10 || s_resc_logged % 120 == 0) {
+            s_resc_logged++;
+            printf("[cellResc] flip#%u target=%u src[%d]=(off=0x%X %ux%u pitch=%u) dst=(off=0x%X %ux%u pitch=%u) blit=%d\n",
+                   s_resc_logged, target_id, index,
+                   index >= 0 && index < 8 ? s_src[index].offset : 0,
+                   index >= 0 && index < 8 ? s_src[index].width : 0,
+                   index >= 0 && index < 8 ? s_src[index].height : 0,
+                   index >= 0 && index < 8 ? s_src[index].pitch : 0,
+                   dst_off, dst_w, dst_h, dst_pitch, did_blit);
+            fflush(stdout);
         }
         cellGcmSetFlipCommand(target_id);
         s_flip_target = (u32)((s_flip_target + 1) % nbuf);
