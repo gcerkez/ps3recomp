@@ -534,8 +534,9 @@ static void pad_shutdown_backend(void)
 
 static u8 pad_sdl_axis_to_u8(int raw)
 {
-    /* SDL axis: -32768..32767 -> 0..255 with center at 128 */
-    int val = ((raw + 32768) * 255) / 65535;
+    /* SDL axis: -32768..32767 -> 0..255 with deadzone and exact center at 128 */
+    if (raw > -4500 && raw < 4500) return 128;
+    int val = ((raw + 32768) * 255 + 32767) / 65535;
     if (val < 0) val = 0;
     if (val > 255) val = 255;
     return (u8)val;
@@ -543,8 +544,9 @@ static u8 pad_sdl_axis_to_u8(int raw)
 
 static u8 pad_sdl_trigger_to_u8(int raw)
 {
-    /* SDL trigger: 0..32767 -> 0..255 */
-    int val = (raw * 255) / 32767;
+    /* SDL trigger: 0..32767 -> 0..255 with deadzone against resting jitter */
+    if (raw < 6500) return 0;
+    int val = ((raw - 6500) * 255) / (32767 - 6500);
     if (val < 0) val = 0;
     if (val > 255) val = 255;
     return (u8)val;
@@ -719,6 +721,19 @@ static void pad_poll_sdl2(void)
         /* Triggers */
         s_host_state[i].trigger_l2 = pad_sdl_trigger_to_u8(lt);
         s_host_state[i].trigger_r2 = pad_sdl_trigger_to_u8(rt);
+
+        static int s_pad_log = -1;
+        if (s_pad_log < 0) s_pad_log = getenv("PAD_DEBUG_LOG") ? 1 : 0;
+        if (s_pad_log && (btns != 0 || s_host_state[i].analog_lx != 128 || s_host_state[i].analog_ly != 128 || s_host_state[i].trigger_l2 != 0 || s_host_state[i].trigger_r2 != 0)) {
+            static unsigned pcount = 0;
+            if (pcount++ % 30 == 0) {
+                printf("[cellPad] p%d: btns=0x%04X lx=%u ly=%u rx=%u ry=%u L2=%u R2=%u (raw lt=%d rt=%d)\n",
+                       i, btns, s_host_state[i].analog_lx, s_host_state[i].analog_ly,
+                       s_host_state[i].analog_rx, s_host_state[i].analog_ry,
+                       s_host_state[i].trigger_l2, s_host_state[i].trigger_r2, lt, rt);
+                fflush(stdout);
+            }
+        }
 
         /* Pressure: SDL has digital buttons, so 0 or 255 */
         s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;

@@ -198,7 +198,19 @@ s32 cellRescSetConvertAndFlip(void* con, s32 index)
     extern u32 cellGcm_display_buffer_count(void);
     u32 nbuf = cellGcm_display_buffer_count();
     if (nbuf) {
-        cellGcmSetFlipCommand(s_flip_target % nbuf);
+        u32 target_id = s_flip_target % nbuf;
+        static u32 s_resc_logged = 0;
+        if (s_resc_logged < 10 || s_resc_logged % 120 == 0) {
+            s_resc_logged++;
+            printf("[cellResc] flip#%u target=%u src[%d]=(off=0x%X %ux%u pitch=%u) blit=0\n",
+                   s_resc_logged, target_id, index,
+                   index >= 0 && index < 8 ? s_src[index].offset : 0,
+                   index >= 0 && index < 8 ? s_src[index].width : 0,
+                   index >= 0 && index < 8 ? s_src[index].height : 0,
+                   index >= 0 && index < 8 ? s_src[index].pitch : 0);
+            fflush(stdout);
+        }
+        cellGcmSetFlipCommand(target_id);
         s_flip_target = (u32)((s_flip_target + 1) % nbuf);
     }
 
