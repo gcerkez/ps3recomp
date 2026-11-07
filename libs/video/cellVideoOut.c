@@ -9,6 +9,7 @@
 #include "ps3emu/endian.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
