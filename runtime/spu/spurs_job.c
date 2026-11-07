@@ -205,6 +205,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         void* keep_cv   = ctx->ch_wait_cv;
         void* keep_lock = ctx->ch_wait_lock;
         memset(ctx->gpr, 0, sizeof(ctx->gpr));
+        memset(ctx->ls_store, 0, SPU_LS_SIZE);
         memset((uint8_t*)ctx + offsetof(spu_context, ls), 0,
                sizeof(*ctx) - offsetof(spu_context, ls));
         ctx->ls           = ctx->ls_store;
