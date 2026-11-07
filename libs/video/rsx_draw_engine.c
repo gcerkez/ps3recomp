@@ -1074,6 +1074,15 @@ int rsx_draw_engine_blit(u32 src_loc, u32 src_off, u32 src_pitch,
     if (si == ENG_INVALID || g.surfaces[si].fmt != RSX_BE_FMT_R8G8B8A8 || (sxb & 3u))
         return 0;
 
+    /* Antialiased surfaces are held at sample resolution (aa_grid), but
+     * the guest's blit geometry is in logical pixels: a GPU blit would
+     * copy the matching rectangle of the sample grid instead of the
+     * logical image -- a quadrant crop for a 2x2 grid (Comet Crash's
+     * scene target). Decline and let the guest-memory path in
+     * cellGcmSys handle AA surfaces, as it did before this fast path. */
+    if ((g.surfaces[si].aa_grid & 0xFFu) > 1u || (g.surfaces[si].aa_grid >> 8) > 1u)
+        return 0;
+
     u32 sx_surf = sxb / 4u;
     if (sx_surf >= g.surfaces[si].w || sy_surf >= g.surfaces[si].h) return 0;
     if (sx_surf + sw > g.surfaces[si].w) sw = g.surfaces[si].w - sx_surf;
@@ -1124,6 +1133,10 @@ int rsx_draw_engine_blit(u32 src_loc, u32 src_off, u32 src_pitch,
         return 0;
     if (g.surfaces[di].fmt != RSX_BE_FMT_R8G8B8A8 ||
         dx_surf + dw > g.surfaces[di].w || dy_surf + dh > g.surfaces[di].h)
+        return 0;
+    /* Same AA rule for the destination: guest offsets are logical
+     * pixels, the engine surface is the sample grid. */
+    if ((g.surfaces[di].aa_grid & 0xFFu) > 1u || (g.surfaces[di].aa_grid >> 8) > 1u)
         return 0;
 
     g.be->color_target_blit(g.be->user,
