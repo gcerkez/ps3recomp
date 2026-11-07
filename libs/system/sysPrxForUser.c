@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include "../../runtime/ps3_log.h"       /* ps3_log_verbose */
 #include "../../runtime/memory/vm.h"
 #include <ps3emu/guest_call.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
@@ -732,7 +733,8 @@ s32 sys_lwcond_signal_all(sys_lwcond_t_hle* lwcond)
 s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
 {
     YZ_XLAT(lwcond, sys_lwcond_t_hle*);
-    fprintf(stderr, "[WAIT] lwcond_wait(timeout=%llu)\n", (unsigned long long)timeout);
+    if (ps3_log_verbose())
+        fprintf(stderr, "[WAIT] lwcond_wait(timeout=%llu)\n", (unsigned long long)timeout);
     if (!lwcond) return CELL_EFAULT;
 
     u32 cslot = lwcond->lwcond_queue - 1;
