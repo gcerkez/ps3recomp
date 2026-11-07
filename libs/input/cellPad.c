@@ -279,7 +279,11 @@ static int pad_key_down(int key)
  * pressed. "Focused" is that some window of this process has the keyboard focus. */
 static int pad_host_window_focused(void)
 {
-    return SDL_GetKeyboardFocus() != NULL;
+    /* On Linux/Wayland with Vulkan, SDL_GetKeyboardFocus() can return NULL
+     * even when the user is actively interacting with the window.
+     * Always allow keyboard events so that fallback keyboard controls (Enter=Start, Z=Cross, etc.)
+     * work reliably. */
+    return 1;
 }
 static int pad_key_down(int key)
 {
@@ -333,6 +337,25 @@ static void pad_poll_keyboard(int merge_only)
     u16 btns = 0;
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
         if (pad_key_down(map[i].vk)) btns |= map[i].btn;
+
+    if (btns != 0) {
+        static u16 s_last_kbtns = 0;
+        if (btns != s_last_kbtns) {
+            printf("[cellPad] keyboard key down: btns=0x%04X (START=%d CROSS=%d CIRCLE=%d SQUARE=%d TRIANGLE=%d UP=%d DOWN=%d LEFT=%d RIGHT=%d)\n",
+                   btns,
+                   (btns & CELL_PAD_CTRL_START) != 0,
+                   (btns & CELL_PAD_CTRL_CROSS) != 0,
+                   (btns & CELL_PAD_CTRL_CIRCLE) != 0,
+                   (btns & CELL_PAD_CTRL_SQUARE) != 0,
+                   (btns & CELL_PAD_CTRL_TRIANGLE) != 0,
+                   (btns & CELL_PAD_CTRL_UP) != 0,
+                   (btns & CELL_PAD_CTRL_DOWN) != 0,
+                   (btns & CELL_PAD_CTRL_LEFT) != 0,
+                   (btns & CELL_PAD_CTRL_RIGHT) != 0);
+            fflush(stdout);
+            s_last_kbtns = btns;
+        }
+    }
 
     if (merge_only) {
         if (!btns) return;
@@ -614,10 +637,25 @@ static void pad_sdl_scan(void)
 {
     const int n = SDL_NumJoysticks();   /* also refreshes sdl2-compat's index list */
     for (int idx = 0; idx < n; idx++) {
-        if (!SDL_IsGameController(idx)) continue;
+        const SDL_JoystickGUID guid = SDL_JoystickGetDeviceGUID(idx);
+        char guid_str[33] = {0};
+        SDL_JoystickGetGUIDString(guid, guid_str, sizeof(guid_str));
+        const char* joy_name = SDL_JoystickNameForIndex(idx);
+
+        if (!SDL_IsGameController(idx)) {
+            /* Try generating a default fallback mapping from its GUID */
+            char fallback[512];
+            snprintf(fallback, sizeof(fallback),
+                "%s,%s,a:b0,b:b1,x:b2,y:b3,back:b6,guide:b8,start:b7,leftstick:b9,rightstick:b10,"
+                "leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,"
+                "leftx:a0,lefty:a1,rightx:a3,righty:a4,lefttrigger:a2,righttrigger:a5,platform:Linux,",
+                guid_str, joy_name ? joy_name : "Gamepad");
+            SDL_GameControllerAddMapping(fallback);
+            if (!SDL_IsGameController(idx)) continue;
+        }
+
         const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(idx);
         if (id < 0 || pad_sdl_port_of(id) >= 0) continue;
-        const SDL_JoystickGUID guid = SDL_JoystickGetDeviceGUID(idx);
         int port = -1, back = 0;
         for (int p = 0; p < PAD_MAX_HOST_PORTS && port < 0; p++)
             if (!s_sdl_controllers[p] && s_sdl_had[p] && !memcmp(&s_sdl_last_guid[p], &guid, sizeof guid)) { port = p; back = 1; }
@@ -629,6 +667,20 @@ static void pad_sdl_scan(void)
             fprintf(stderr, "[cellPad] SDL controller %d: open failed: %s\n", idx, SDL_GetError());
             continue;
         }
+
+        char* map = SDL_GameControllerMapping(gc);
+        if (!map) {
+            /* If SDL opened it but has no mapping, install standard fallback mapping */
+            char fallback[512];
+            snprintf(fallback, sizeof(fallback),
+                "%s,%s,a:b0,b:b1,x:b2,y:b3,back:b6,guide:b8,start:b7,leftstick:b9,rightstick:b10,"
+                "leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,"
+                "leftx:a0,lefty:a1,rightx:a3,righty:a4,lefttrigger:a2,righttrigger:a5,platform:Linux,",
+                guid_str, joy_name ? joy_name : "Gamepad");
+            SDL_GameControllerAddMapping(fallback);
+            map = SDL_GameControllerMapping(gc);
+        }
+
         s_sdl_controllers[port] = gc;
         s_sdl_ids[port] = id;
         s_sdl_last_guid[port] = guid;
@@ -636,9 +688,15 @@ static void pad_sdl_scan(void)
         memset(&s_rumble[port], 0, sizeof s_rumble[port]);   /* nothing left over from before */
         SDL_GameControllerRumble(gc, 0, 0, 0);
         const char* name = SDL_GameControllerName(gc);
-        fprintf(stderr, "[cellPad] SDL controller %s on port %d: %s (instance %d)%s\n",
-                back ? "reconnected" : "connected", port, name ? name : "?", (int)id,
+        fprintf(stderr, "[cellPad] SDL controller %s on port %d: %s (GUID %s, instance %d)%s\n",
+                back ? "reconnected" : "connected", port, name ? name : "?", guid_str, (int)id,
                 SDL_GameControllerHasRumble(gc) ? "" : " (no rumble)");
+        if (map) {
+            fprintf(stderr, "[cellPad] port %d mapping: %s\n", port, map);
+            SDL_free(map);
+        } else {
+            fprintf(stderr, "[cellPad] port %d WARNING: controller has NO mapping in SDL!\n", port);
+        }
     }
 }
 
@@ -735,6 +793,25 @@ static void pad_poll_sdl2(void)
             }
         }
 
+        if (btns != 0) {
+            static u16 s_last_btns[PAD_MAX_HOST_PORTS] = {0};
+            if (btns != s_last_btns[i]) {
+                printf("[cellPad] port %d button down: btns=0x%04X (START=%d CROSS=%d CIRCLE=%d SQUARE=%d TRIANGLE=%d UP=%d DOWN=%d LEFT=%d RIGHT=%d)\n",
+                       i, btns,
+                       (btns & CELL_PAD_CTRL_START) != 0,
+                       (btns & CELL_PAD_CTRL_CROSS) != 0,
+                       (btns & CELL_PAD_CTRL_CIRCLE) != 0,
+                       (btns & CELL_PAD_CTRL_SQUARE) != 0,
+                       (btns & CELL_PAD_CTRL_TRIANGLE) != 0,
+                       (btns & CELL_PAD_CTRL_UP) != 0,
+                       (btns & CELL_PAD_CTRL_DOWN) != 0,
+                       (btns & CELL_PAD_CTRL_LEFT) != 0,
+                       (btns & CELL_PAD_CTRL_RIGHT) != 0);
+                fflush(stdout);
+                s_last_btns[i] = btns;
+            }
+        }
+
         /* Pressure: SDL has digital buttons, so 0 or 255 */
         s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
         s_host_state[i].press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
@@ -746,6 +823,55 @@ static void pad_poll_sdl2(void)
         s_host_state[i].press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
         s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
         s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+    }
+}
+
+static void pad_load_gamecontroller_db(void)
+{
+    /* 1. Explicit environment variable */
+    const char* env_path = getenv("SDL_GAMECONTROLLERCONFIG_FILE");
+    if (env_path && *env_path) {
+        int count = SDL_GameControllerAddMappingsFromFile(env_path);
+        if (count > 0) {
+            fprintf(stderr, "[cellPad] loaded %d controller mappings from SDL_GAMECONTROLLERCONFIG_FILE (%s)\n", count, env_path);
+        }
+    }
+
+    /* 2. Common file paths */
+    static const char* const candidates[] = {
+        "gamecontrollerdb.txt",
+        "./gamecontrollerdb.txt",
+        "../gamecontrollerdb.txt",
+        "/home/gcerkez/tools/cc-recomp/gamecontrollerdb.txt",
+        "/home/gcerkez/comet-crash-re/recomp/gamecontrollerdb.txt",
+        "/home/gcerkez/.local/share/lutris/runtime/gamecontrollerdb/gamecontrollerdb.txt",
+        "/var/home/gcerkez/.local/share/lutris/runtime/gamecontrollerdb/gamecontrollerdb.txt",
+        "/usr/share/games/gamecontrollerdb.txt",
+        "/usr/share/gamecontrollerdb/gamecontrollerdb.txt",
+    };
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        int count = SDL_GameControllerAddMappingsFromFile(candidates[i]);
+        if (count > 0) {
+            fprintf(stderr, "[cellPad] loaded %d controller mappings from %s\n", count, candidates[i]);
+            break;
+        }
+    }
+
+    /* 3. Hardcoded built-in mappings for common Linux controllers */
+    static const char* const builtin_mappings[] = {
+        // Microsoft Xbox One Elite 2 Controller (Linux wireless/usb)
+        "030010f85e040000000b00000d050000,Xbox One Elite 2 Controller,a:b0,b:b1,x:b2,y:b3,back:b6,guide:b8,start:b7,leftstick:b9,rightstick:b10,leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,paddle1:b12,paddle2:b11,paddle3:b14,paddle4:b13,leftx:a0,lefty:a1,rightx:a3,righty:a4,lefttrigger:a2,righttrigger:a5,platform:Linux,",
+        // Microsoft Xbox One Controller (Linux generic xpad)
+        "030000005e040000000b000007040000,Microsoft Xbox One Elite 2,a:b0,b:b1,back:b6,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b8,leftshoulder:b4,leftstick:b9,lefttrigger:a2,leftx:a0,lefty:a1,paddle1:b12,paddle2:b14,paddle3:b13,paddle4:b15,rightshoulder:b5,rightstick:b10,righttrigger:a5,rightx:a3,righty:a4,start:b7,x:b2,y:b3,platform:Linux,",
+        "030000005e040000000b000008040000,Microsoft Xbox One Elite 2,a:b0,b:b1,back:b6,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b8,leftshoulder:b4,leftstick:b9,lefttrigger:a2,leftx:a0,lefty:a1,paddle1:b12,paddle2:b14,paddle3:b13,paddle4:b15,rightshoulder:b5,rightstick:b10,righttrigger:a5,rightx:a3,righty:a4,start:b7,x:b2,y:b3,platform:Linux,",
+        // Sony DualSense (Linux USB / Bluetooth)
+        "030000004c050000e60c000000000000,PS5 DualSense,a:b0,b:b1,back:b8,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b12,leftshoulder:b4,leftstick:b10,lefttrigger:a3,leftx:a0,lefty:a1,rightshoulder:b5,rightstick:b11,righttrigger:a4,rightx:a2,righty:a5,start:b9,x:b2,y:b3,platform:Linux,",
+        // Sony DualShock 4 (Linux USB / Bluetooth)
+        "030000004c050000c405000000000000,PS4 DualShock 4,a:b1,b:b2,back:b8,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b12,leftshoulder:b4,leftstick:b10,lefttrigger:a3,leftx:a0,lefty:a1,rightshoulder:b5,rightstick:b11,righttrigger:a4,rightx:a2,righty:a5,start:b9,x:b0,y:b3,platform:Linux,",
+    };
+    for (size_t i = 0; i < sizeof(builtin_mappings) / sizeof(builtin_mappings[0]); i++) {
+        SDL_GameControllerAddMapping(builtin_mappings[i]);
     }
 }
 
@@ -767,6 +893,7 @@ static void pad_init_backend(void)
             SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
             SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
         }
+        pad_load_gamecontroller_db();
         s_sdl_inited = 1;
     }
     memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
