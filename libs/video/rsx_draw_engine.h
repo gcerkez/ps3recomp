@@ -300,6 +300,13 @@ typedef struct rsx_draw_backend {
                                      float depth_value, u8 stencil,
                                      u32 x, u32 y, u32 w, u32 h);
 
+    /* Optional. GPU-side rectangle blit (1:1 or scaled) between two colour
+     * targets, ordered into the open command stream without reading back to
+     * host memory. */
+    void (*color_target_blit)(void* user, u32 src_surface, u32 sx, u32 sy,
+                              u32 sw, u32 sh, u32 dst_surface, u32 dx, u32 dy,
+                              u32 dw, u32 dh, int linear);
+
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -362,6 +369,14 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
  * out with the same pitch take part; anything else is left alone. */
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+
+/* Perform a 2D colour surface blit directly on the GPU when `src` resolves to
+ * a rendered RGBA8 engine surface. Returns 1 when handled on the GPU (skipping
+ * host readback and CPU copy), 0 to fall back to the guest-memory path. */
+int  rsx_draw_engine_blit(u32 src_loc, u32 src_off, u32 src_pitch,
+                          u32 sx, u32 sy, u32 sw, u32 sh,
+                          u32 dst_loc, u32 dst_off, u32 dst_pitch,
+                          u32 dx, u32 dy, u32 dw, u32 dh, int linear);
 
 /* --- test hooks ---------------------------------------------------------- */
 

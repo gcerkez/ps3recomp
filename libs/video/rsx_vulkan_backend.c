@@ -1798,8 +1798,11 @@ static int vk_create_swapchain(void)
     if (nf == 0) { VK_LOG("surface reports no formats\n"); return -1; }
     if (nf > 64) nf = 64;
     VkSurfaceFormatKHR fmts[64];
-    VK_CHECK(pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, fmts),
-             "vkGetPhysicalDeviceSurfaceFormatsKHR");
+    VkResult sfr = pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, fmts);
+    if (sfr != VK_SUCCESS && sfr != VK_INCOMPLETE) {
+        VK_LOG("vkGetPhysicalDeviceSurfaceFormatsKHR failed (VkResult %d)\n", (int)sfr);
+        return -1;
+    }
     /* UNORM, not SRGB: the offscreen target holds the guest's values as-is. */
     VkSurfaceFormatKHR fmt = fmts[0];
     if (nf == 1 && fmts[0].format == VK_FORMAT_UNDEFINED) {
@@ -2050,7 +2053,9 @@ static void vk_present_complete_locked(void)
 
     vk_invalidate(&s_vk.readback);
     const unsigned char* px = (const unsigned char*)s_vk.readback.ptr;
-    size_t c = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
+    size_t c = s_vk.dump_path
+             ? ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4
+             : 0;
     s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
     s_vk.presented++;
     if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
@@ -2076,9 +2081,13 @@ static VkCommandBuffer vk_present_record_begin(void)
 static void vk_present_record_end(VkCommandBuffer cb)
 {
     vk_barrier_image_on(cb, s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    const int full_rb = (s_vk.dump_path != NULL);
     VkBufferImageCopy region = {
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .imageExtent = { s_vk.width, s_vk.height, 1 },
+        .imageOffset = full_rb ? (VkOffset3D){ 0, 0, 0 }
+                               : (VkOffset3D){ (int32_t)(s_vk.width / 2), (int32_t)(s_vk.height / 2), 0 },
+        .imageExtent = full_rb ? (VkExtent3D){ s_vk.width, s_vk.height, 1 }
+                               : (VkExtent3D){ 1, 1, 1 },
     };
     pvkCmdCopyImageToBuffer(cb, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
                             s_vk.readback.buf, 1, &region);
@@ -2086,7 +2095,8 @@ static void vk_present_record_end(VkCommandBuffer cb)
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = s_vk.readback.buf, .offset = 0, .size = VK_WHOLE_SIZE,
+        .buffer = s_vk.readback.buf, .offset = 0,
+        .size = full_rb ? VK_WHOLE_SIZE : 4,
     };
     pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           0, 0, NULL, 1, &host, 0, NULL);
@@ -2576,6 +2586,35 @@ static void vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
     vk_eng_upload_region(o->im.img, 0, 0, x, y, w, h, (size_t)w * o->bpp, h, rows, row_bytes);
 }
 
+static void vk_eng_color_target_blit(void* user, u32 src_surface, u32 sx, u32 sy,
+                                     u32 sw, u32 sh, u32 dst_surface, u32 dx, u32 dy,
+                                     u32 dw, u32 dh, int linear)
+{
+    (void)user;
+    vk_eng_obj* s = vk_eng_get(src_surface, VK_ENG_COLOR);
+    vk_eng_obj* d = vk_eng_get(dst_surface, VK_ENG_COLOR);
+    if (!s || !d || s == d || !sw || !sh || !dw || !dh) return;
+    if (sx + sw > s->w || sy + sh > s->h || dx + dw > d->w || dy + dh > d->h) return;
+    const int batched = vk_eb_active();
+    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) return;
+    vk_barrier_image(s->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(d->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkImageBlit blit = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffsets = { { (int32_t)sx, (int32_t)sy, 0 },
+                        { (int32_t)(sx + sw), (int32_t)(sy + sh), 1 } },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffsets = { { (int32_t)dx, (int32_t)dy, 0 },
+                        { (int32_t)(dx + dw), (int32_t)(dy + dh), 1 } },
+    };
+    pvkCmdBlitImage(s_vk.cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL,
+                    d->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                    linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    vk_barrier_image(d->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    if (batched) vk_eb_recorded();
+    else vk_submit_and_wait();
+}
+
 static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                             void* out, u32 out_pitch)
 {
@@ -2760,7 +2799,8 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
     }
     o->kind = VK_ENG_COLOR; o->snapshot = 1;
     o->fmt = t->fmt; o->bpp = t->bpp; o->w = t->w; o->h = t->h;
-    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+    const int batched = vk_eb_active();
+    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT,
                      reused ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED);
     vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -2773,7 +2813,8 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
                     o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     /* The copy, made visible to whatever samples it next. */
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    if (batched) vk_eb_recorded();
+    else if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
     return hd;
 }
 
@@ -3908,6 +3949,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .readback             = vk_eng_readback,
     .depth_readback       = vk_eng_depth_readback,
     .color_target_write   = vk_eng_color_target_write,
+    .color_target_blit    = vk_eng_color_target_blit,
     /* Every draw and every upload submits and waits, so an upload runs after
      * each earlier draw that sampled the old bytes has completed. */
     .texture_upload_ordered = 1,

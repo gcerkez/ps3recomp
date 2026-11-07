@@ -1171,6 +1171,7 @@ static struct {
  * as an NV308A "point" and the blit destination was never picked up at all.
  * The two are told apart by method 0x0300: NV308A has no such method. */
 static struct {
+    u32 dst_dma;    /* 0x0184: destination DMA (0xFEED0000 local, 0xFEED0001 main) */
     u32 fmt;        /* 0x0300: (log2h << 24) | (log2w << 16) | format */
     u32 offset;     /* 0x0304: destination offset                     */
     int active;
@@ -1179,6 +1180,24 @@ static struct {
                      * flag made 5's NV308A POINT (also 0x0304) be swallowed as
                      * an NV309E offset, breaking every inline transfer. */
 } s_nv309e;
+
+/* NV0039 MEMORY_TO_MEMORY_FORMAT (cellGcmSetTransferData / SetTransferImage,
+ * swizzled mip tails, and PSGL inline fragment-constant patching). */
+static struct {
+    u32 dma_in;     /* 0x0184 SET_CONTEXT_DMA_BUFFER_IN  */
+    u32 dma_out;    /* 0x0188 SET_CONTEXT_DMA_BUFFER_OUT */
+    u32 off_in;     /* 0x030C OFFSET_IN                  */
+    u32 off_out;    /* 0x0310 OFFSET_OUT                 */
+    s32 pitch_in;   /* 0x0314 PITCH_IN  (signed)         */
+    s32 pitch_out;  /* 0x0318 PITCH_OUT (signed)         */
+    u32 line_len;   /* 0x031C LINE_LENGTH_IN             */
+    u32 line_cnt;   /* 0x0320 LINE_COUNT                 */
+    u32 fmt;        /* 0x0324 FORMAT ((out_step<<8)|in_step) */
+} s_nv0039 = { 0, 0, 0, 0, 0, 0, 0, 0, 0x0101u };
+
+/* Last SET_OBJECT (method 0) handle per FIFO subchannel, or inferred NV0039
+ * (0x31337303) when subchannel 1 receives DMA handles on 0x0184. */
+static u32 s_subch_obj[8];
 
 /* Execute one NV3089 blit into the currently-bound NV3062 destination surface.
  * Point-sampled: ds/dx and dt/dy are 20.12 fixed point and are 0x100000 (1.0)
@@ -1252,6 +1271,40 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
     gcm_store(d, vm_base + s, n);
 }
 
+static void nv0039_copy(void)
+{
+    extern u8* vm_base;
+    if (!s_nv0039.line_len || !s_nv0039.line_cnt) return;
+    const int in_local  = (s_nv0039.dma_in  != 0xFEED0001u);
+    const int out_local = (s_nv0039.dma_out != 0xFEED0001u);
+    const u32 src = cellGcmResolveLocated(in_local,  s_nv0039.off_in);
+    const u32 dst = cellGcmResolveLocated(out_local, s_nv0039.off_out);
+    if (!src || !dst) return;
+    u32 in_step  = s_nv0039.fmt & 0xFFu;        if (!in_step)  in_step  = 1u;
+    u32 out_step = (s_nv0039.fmt >> 8) & 0xFFu; if (!out_step) out_step = 1u;
+    const u64 vm_lim = ppu_vm_size ? (u64)ppu_vm_size : (u64)VM_TOTAL_SIZE;
+    if (in_step == 1u && out_step == 1u) {
+        const u32 n = s_nv0039.line_len;
+        for (u32 r = 0; r < s_nv0039.line_cnt; r++) {
+            const s64 sa = (s64)src + (s64)r * (s64)s_nv0039.pitch_in;
+            const s64 da = (s64)dst + (s64)r * (s64)s_nv0039.pitch_out;
+            if (sa < 0 || da < 0 || (u64)sa + n > vm_lim || (u64)da + n > vm_lim) continue;
+            gcm_row_copy((u32)da, (u32)sa, n);
+        }
+    } else {
+        for (u32 r = 0; r < s_nv0039.line_cnt; r++) {
+            const s64 sa = (s64)src + (s64)r * (s64)s_nv0039.pitch_in;
+            const s64 da = (s64)dst + (s64)r * (s64)s_nv0039.pitch_out;
+            for (u32 c = 0; c < s_nv0039.line_len; c++) {
+                const s64 sp = sa + (s64)((u64)c * in_step);
+                const s64 dp = da + (s64)((u64)c * out_step);
+                if (sp >= 0 && dp >= 0 && (u64)sp < vm_lim && (u64)dp < vm_lim)
+                    vm_base[(u64)dp] = vm_base[(u64)sp];
+            }
+        }
+    }
+}
+
 /* Guest memory as the 2D engines reach it, for the tiled range copies
  * (rsx_tiling.h): a write keeps gcm_store's reservation bookkeeping. */
 static u8* gcm_tiled_ptr(void* user, u32 location, u32 offset, u32 len)
@@ -1302,7 +1355,8 @@ static void nv3089_blit(void)
     u32 out_x = s_nv3089.out_pt & 0xFFFF, out_y = s_nv3089.out_pt >> 16;
     u32 in_pitch = s_nv3089.in_fmt & 0xFFFF;
     u32 dst_pitch = s_gcm2d.pitch >> 16;
-    if (!out_w || !out_h || !in_pitch || !dst_pitch) return;
+    const int to_swz = s_nv309e.active && s_nv3089.dst_surf != 0x313371C3u;
+    if (!out_w || !out_h || !in_pitch || (!to_swz && !dst_pitch)) return;
     /* NV3089_GATE=<file>: log every blit's geometry while <file> exists, so a
      * capture covers the scene of interest instead of the first N since boot. */
     { static const char* gate = (const char*)-1; static unsigned poll; static int open_gate;
@@ -1317,12 +1371,12 @@ static void nv3089_blit(void)
                      s_nv3089.ds_dx, s_nv3089.dt_dy,
                      cellGcmResolveLocated(_sl, s_nv3089.in_off), in_pitch,
                      cellGcmResolveLocated(_dl, s_gcm2d.dst_offset), dst_pitch,
-                     s_nv309e.active, 10);
+                     to_swz, 10);
           }
       } }
     /* A copy out of a surface the live renderer drew exists only on the GPU;
      * mirror 1:1 blits there too (the guest-memory copy below still runs). */
-    if (s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+    if (!to_swz && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
         rsx_live_draw_enabled()) {
         const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
         const int sl = (s_nv3089.src_dma != 0xFEED0001u);
@@ -1331,7 +1385,7 @@ static void nv3089_blit(void)
                            dl ? 0u : 1u, s_gcm2d.dst_offset + (s_nv3089.out_pt >> 16) * dst_pitch
                                          + (s_nv3089.out_pt & 0xFFFF) * 4u, dst_pitch,
                            out_w, out_h);
-    } else if (rsx_live_draw_enabled()) {
+    } else if (!to_swz && rsx_live_draw_enabled()) {
         /* Scaled: a resolve. Copy it on the GPU into the display buffer; fall
          * back to presenting the source when that cannot be done. */
         const u32 sl = s_nv3089.src_dma != 0xFEED0001u ? 0u : 1u;
@@ -1343,67 +1397,61 @@ static void nv3089_blit(void)
         if (!rok && s_nv3089.in_uv <= 0x00100010u && !s_nv3089.out_pt)
             rsx_live_draw_note_resolve(sl, s_nv3089.in_off, dl, s_gcm2d.dst_offset);
     }
-    /* Only the 32-bit colour formats are handled; anything else would need a
-     * per-format converter and is better skipped loudly than written wrong. */
     u32 f = s_nv3089.fmt & 0xFF;
-    /* NOTE: format 0x3 appears here as a downsample chain (1024x512 -> 1024x256
-     * -> 512x128 -> 256x64 -> 128x32, all into one destination) that builds a
-     * mip/blur pyramid, and skipping it leaves that texture empty. Treating it
-     * as 4-byte A8R8G8B8 like 7/8/0xD is WRONG -- it floods the scene blue
-     * (flat-blue coverage 17k -> 537k pixels), so its pixel layout differs.
-     * Decode it properly before enabling; do not just add it to this list. */
-    /* NV309E swizzled destination. Colour format 0x3 is A8R8G8B8 in the
-     * scaled-image enum; this title uses it to build a mip/blur pyramid into a
-     * swizzled texture (1024x512 -> 1024x256 -> ... all through NV309E).
-     * Writing it LINEARLY into the NV3062 destination is what flooded the scene
-     * blue -- wrong destination and wrong layout. */
+    /* NV309E swizzled destination (CONTEXT_SWIZZLE2D, handle 0x31337A73).
+     * cellGcmSetTransferSwizzleImage uses NV3089 f=3 (4Bpp A8R8G8B8), f=7
+     * (2Bpp R5G6B5/G8B8, e.g. POT luminance-alpha font textures), or f=8
+     * (1Bpp Y8), and splits >1024 surfaces into 1024x1024 tiles or sub-rects.
+     * Note NV309E has no pitch register, so dst_pitch may legitimately be 0. */
     { u32 l2w = (s_nv309e.fmt >> 16) & 0xFF, l2h = (s_nv309e.fmt >> 24) & 0xFF;
       static int en = -1;
-      /* On by default: this is the mip/blur pyramid. Without it textures have
-       * no mip levels, which shows up as aliased blocky tiles and a noise patch
-       * where a minified surface should be, and the shell that samples the
-       * pyramid draws untextured. NV309E_BLIT=0 disables. */
       if (en < 0) { const char* e = getenv("NV309E_BLIT"); en = e ? atoi(e) : 1; }
-      if (en && f == 3 && s_nv309e.active && s_nv309e.offset &&
-          (1u << l2w) == out_w && (1u << l2h) == out_h) {
+      const u32 swz_bpp = (f == 3 || f == 4 || f == 0xD) ? 4u
+                        : (f == 7 || f == 1 || f == 2)   ? 2u
+                        : (f == 8 || f == 9)             ? 1u : 0u;
+      if (en && to_swz && swz_bpp && l2w <= 12 && l2h <= 12 &&
+          out_x + out_w <= (1u << l2w) && out_y + out_h <= (1u << l2h)) {
         int sl = (s_nv3089.src_dma != 0xFEED0001u);
+        int dl = (s_nv309e.dst_dma != 0xFEED0001u);
         u32 src2 = cellGcmResolveLocated(sl, s_nv3089.in_off);
-        u32 dst2 = cellGcmResolveLocated(1, s_nv309e.offset);
+        u32 dst2 = cellGcmResolveLocated(dl, s_nv309e.offset);
+        if (!src2 || !dst2) return;
         u32 u0b = s_nv3089.in_uv & 0xFFFF, v0b = s_nv3089.in_uv >> 16;
-        nv3089_engine_read(in_pitch, out_w, out_h);
+        if (swz_bpp == 4u) nv3089_engine_read(in_pitch, out_w, out_h);
         /* A source in tiled main memory is read a row at a time through the
          * tiling, up to the last texel the row samples. */
         const int stiled = gcm_rect_tiled(sl, s_nv3089.in_off, in_pitch, s_nv3089.in_sz >> 16);
         const u32 sw = (u32)((nv3089_origin(u0b) + (u64)(out_w - 1u) * s_nv3089.ds_dx) >> 20) + 1u;
-        u8* trow = stiled ? gcm_rows(sw * 4u) : NULL;
+        u8* trow = stiled ? gcm_rows(sw * swz_bpp) : NULL;
         if (stiled && !trow) return;
-        /* Copy words verbatim through raw pointers rather than vm_read32/
-         * vm_write32: this moves ~500k pixels per blit and several blits run per
-         * frame, and the two byte swaps would cancel anyway. */
+        /* Copy texels verbatim through raw pointers rather than vm_read/
+         * vm_write: the two byte swaps would cancel anyway. */
         { extern u8* vm_base;
           const u8* sbase = vm_base + src2;
           u8* dbase = vm_base + dst2;
           for (u32 y = 0; y < out_h; y++) {
               u64 sv = nv3089_origin(v0b) + (u64)y * s_nv3089.dt_dy;
-              const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
+              const u8* srow = sbase + (u64)(u32)(sv >> 20) * in_pitch;
               if (stiled) {
                   rsx_tiled_read(&s_gcm_mem, RSX_LOCATION_MAIN, s_nv3089.in_off + (u32)(sv >> 20) * in_pitch,
-                                 trow, sw * 4u);
+                                 trow, sw * swz_bpp);
                   srow = trow;
               }
               for (u32 x = 0; x < out_w; x++) {
                   u64 su = nv3089_origin(u0b) + (u64)x * s_nv3089.ds_dx;
-                  memcpy(dbase + (u64)nv309e_swz(x, y, l2w, l2h) * 4,
-                         srow + (u32)(su >> 20) * 4, 4);
+                  memcpy(dbase + (u64)nv309e_swz(out_x + x, out_y + y, l2w, l2h) * swz_bpp,
+                         srow + (u64)(u32)(su >> 20) * swz_bpp, swz_bpp);
               }
           } }
         { static int _n = 0; static int cap = -1;
           if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
           if (cap && _n < cap) { _n++;
-            printf("[NV3089] swizzled %ux%u fmt=0x%X src=0x%08X -> NV309E dst=0x%08X%c",
-                   out_w, out_h, f, src2, dst2, 10); } }
+            printf("[NV3089] swizzled %ux%u (at %u,%u bpp=%u) fmt=0x%X src=0x%08X -> NV309E dst=0x%08X%c",
+                   out_w, out_h, out_x, out_y, swz_bpp, f, src2, dst2, 10); } }
         return;
-      } }
+      }
+      if (to_swz) return;
+    }
     /* 0x3 is A8R8G8B8 in the scaled-image format enum. This title uses it for
      * two different things: the swizzled mip/blur pyramid handled above, and
      * (with a LINEAR NV3062 destination) copies of the rendered scene surface
@@ -1412,8 +1460,8 @@ static void nv3089_blit(void)
      * sampled blended texture in the frame. Skipping those left every one of
      * those textures empty. Same 4-byte pixel layout as the formats already
      * handled. */
-    if (f != 3 /* A8R8G8B8 (scale-format enum) */ &&
-        f != 7 /* A8R8G8B8 */ && f != 8 /* X8R8G8B8 */ && f != 0xD /* A8B8G8R8 */) {
+    if (f != 3 /* A8R8G8B8 (scale-format enum) */ && f != 4 /* X8R8G8B8 */ &&
+        f != 7 /* R5G6B5 */ && f != 8 /* Y8 */ && f != 0xD /* X8B8G8R8 */) {
         /* Log the GEOMETRY of a skipped blit, not just the format: a full-screen
          * copy from the scene surface to a registered display buffer is the
          * composite this title needs, and is worth telling apart from some
@@ -1451,6 +1499,37 @@ static void nv3089_blit(void)
     u32 dbpp = (s_gcm2d.color_fmt == 4u /* R5G6B5 */) ? 2u
              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
+    const u32 in_w = s_nv3089.in_sz & 0xFFFF;
+    const int any_tiled = in_w &&
+        (gcm_rect_tiled(src_local, s_nv3089.in_off, in_pitch, s_nv3089.in_sz >> 16) ||
+         gcm_rect_tiled(dst_local, s_gcm2d.dst_offset, dst_pitch, out_y + out_h));
+
+    /* GPU fast-path: when a 32-bit blit reads an engine-rendered RGBA8 surface,
+     * perform the 1:1 or scaled blit directly on the host GPU (vkCmdBlitImage)
+     * instead of stalling the pipeline for a VRAM->CPU readback + CPU copy. */
+    if (bpp == 4 && !any_tiled && rsx_draw_engine_enabled()) {
+        u32 xa = (out_x < cx0) ? (cx0 - out_x) : 0u;
+        u32 xb = ((u64)out_x + out_w > cx1) ? (cx1 > out_x ? cx1 - out_x : 0u) : out_w;
+        u32 ya = (out_y < cy0) ? (cy0 - out_y) : 0u;
+        u32 yb = ((u64)out_y + out_h > cy1) ? (cy1 > out_y ? cy1 - out_y : 0u) : out_h;
+        if (xa >= xb || ya >= yb) return;
+        const u32 dw = xb - xa, dh = yb - ya;
+        const u32 sx = (u32)((nv3089_origin(u0) + (u64)xa * s_nv3089.ds_dx) >> 20);
+        const u32 sy = (u32)((nv3089_origin(v0) + (u64)ya * s_nv3089.dt_dy) >> 20);
+        const int scaled = (s_nv3089.ds_dx != 0x100000u || s_nv3089.dt_dy != 0x100000u);
+        u32 sw = scaled ? (u32)(((u64)dw * s_nv3089.ds_dx + 0x80000u) >> 20) : dw;
+        u32 sh = scaled ? (u32)(((u64)dh * s_nv3089.dt_dy + 0x80000u) >> 20) : dh;
+        if (!sw) sw = 1u;
+        if (!sh) sh = 1u;
+        const u32 sloc = src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        const u32 dloc = dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        if (rsx_draw_engine_blit(sloc, s_nv3089.in_off, in_pitch, sx, sy, sw, sh,
+                                 dloc, s_gcm2d.dst_offset, dst_pitch,
+                                 out_x + xa, out_y + ya, dw, dh, scaled)) {
+            return;
+        }
+    }
+
     if (bpp == 4) nv3089_engine_read(in_pitch, out_w, out_h);
     /* NV3089_ROWCOPY (default 1): an unscaled blit copies a row at a time.
      * The per-pixel loop pays a vm_read32 and a vm_write32 per pixel -- the
@@ -1464,9 +1543,7 @@ static void nv3089_blit(void)
     /* A side in tiled main memory goes through the tiling (rsx_tiling.h).
      * A retail title downsamples its scene and depth into a tiled main-memory
      * region for an SPU depth-of-field job while aiming. */
-    const u32 in_w = s_nv3089.in_sz & 0xFFFF;
-    if (in_w && (gcm_rect_tiled(src_local, s_nv3089.in_off, in_pitch, s_nv3089.in_sz >> 16) ||
-                 gcm_rect_tiled(dst_local, s_gcm2d.dst_offset, dst_pitch, out_y + out_h))) {
+    if (any_tiled) {
         /* Row at a time: the source row read as the RSX sees it, the
          * destination row built linearly and written the same way. */
         u8* srow = gcm_rows((in_w + out_w) * bpp);
@@ -1509,6 +1586,33 @@ static void nv3089_blit(void)
             }
         }
     } else
+    if (rowcopy) {
+        extern u8* vm_base;
+        u32 xa = (out_x < cx0) ? (cx0 - out_x) : 0u;
+        u32 xb = ((u64)out_x + out_w > cx1) ? (cx1 > out_x ? cx1 - out_x : 0u) : out_w;
+        u8* drow = (xa < xb) ? gcm_rows((xb - xa) * bpp) : NULL;
+        if (drow) {
+            const u32 n = (xb - xa) * bpp;
+            for (u32 y = 0; y < out_h; y++) {
+                const u32 dy = out_y + y;
+                if (dy < cy0 || dy >= cy1) continue;
+                const u32 sy = (u32)((nv3089_origin(v0) + (u64)y * s_nv3089.dt_dy) >> 20);
+                const u64 srow_ea = (u64)src + (u64)sy * in_pitch;
+                const u64 da = (u64)dst + (u64)dy * dst_pitch + (u64)(out_x + xa) * bpp;
+                if (da + n > 0x100000000ull || srow_ea >= 0x100000000ull) continue;
+                const u8* sp = vm_base + srow_ea;
+                for (u32 x = xa; x < xb; x++) {
+                    const u32 sx = (u32)((nv3089_origin(u0) + (u64)x * s_nv3089.ds_dx) >> 20);
+                    const u64 so = (u64)sx * bpp;
+                    if (srow_ea + so + bpp <= 0x100000000ull)
+                        memcpy(drow + (x - xa) * bpp, sp + so, bpp);
+                    else
+                        memset(drow + (x - xa) * bpp, 0, bpp);
+                }
+                gcm_store((u32)da, drow, n);
+            }
+        }
+    } else
     for (u32 y = 0; y < out_h; y++) {
         u32 dy = out_y + y;
         if (dy < cy0 || dy >= cy1) continue;
@@ -1541,6 +1645,7 @@ static void nv3089_blit(void)
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
+    if (method == 0) return;
     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
      * subchannel a title binds each 2D object to is libgcm-version-specific and
      * SET_OBJECT binds are not tracked, so state landing on an unexpected
@@ -1565,6 +1670,26 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
               printf("---%c", 10);
           }
       } }
+    /* NV0039 MEMORY_TO_MEMORY_FORMAT on subchannel 1 (or any subchannel
+     * explicitly bound to NV0039 via SET_OBJECT). */
+    if (subch == 1 || (subch < 8 && (s_subch_obj[subch] == 0x31337303u ||
+                                     s_subch_obj[subch] == 0x0039u ||
+                                     s_subch_obj[subch] == 0x5039u))) {
+        switch (method) {
+        case 0x0104: case 0x0180: return;
+        case 0x0184: s_nv0039.dma_in    = data; return;
+        case 0x0188: s_nv0039.dma_out   = data; return;
+        case 0x030C: s_nv0039.off_in    = data; return;
+        case 0x0310: s_nv0039.off_out   = data; return;
+        case 0x0314: s_nv0039.pitch_in  = (s32)data; return;
+        case 0x0318: s_nv0039.pitch_out = (s32)data; return;
+        case 0x031C: s_nv0039.line_len  = data; return;
+        case 0x0320: s_nv0039.line_cnt  = data; return;
+        case 0x0324: s_nv0039.fmt       = data; return;
+        case 0x0328: nv0039_copy(); return;
+        }
+        return;
+    }
     /* Subchannel bindings are libgcm-version-specific (SET_OBJECT binds are
      * not tracked): demosaic's SDK emits dest-surface on sub 3 and image-from-
      * CPU on sub 5 (cellGcmSetInlineTransfer: 0x4630C / 0xCA304 / 0xA400
@@ -1572,13 +1697,16 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
     if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
         switch (method) {
         case 0x0184: case 0x0188: s_gcm2d.dst_dma = data; return;
-        case 0x0300: s_gcm2d.color_fmt  = data; return;
+        case 0x0300: s_gcm2d.color_fmt  = data; if (s_nv3089.dst_surf != 0x31337A73u) s_nv309e.active = 0; return;
         case 0x0304: s_gcm2d.pitch      = data; return;
-        case 0x030C: s_gcm2d.dst_offset = data; return;
+        case 0x030C: s_gcm2d.dst_offset = data; if (s_nv3089.dst_surf != 0x31337A73u) s_nv309e.active = 0; return;
         }
         return;
     }
     if (subch == 4 || subch == 5) {         /* NV308A image-from-CPU, or NV309E */
+        if (method == 0x0184 && (data == 0xFEED0000u || data == 0xFEED0001u)) {
+            s_nv309e.dst_dma = data; return;
+        }
         /* NV309E swizzled-surface state. SET_FORMAT (0x0300) does not exist on
          * NV308A, so seeing it identifies the object bound here. */
         if (method == 0x0300) { s_nv309e.fmt = data; s_nv309e.active = 1;
@@ -1634,7 +1762,12 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
     if (subch == 6 || subch == 7) {
         switch (method) {
         case 0x0184: s_nv3089.src_dma   = data; return;
-        case 0x0198: s_nv3089.dst_surf  = data; return;
+        case 0x0198:
+            s_nv3089.dst_surf = data;
+            if (data == 0x313371C3u) s_nv309e.active = 0;
+            else if (data == 0x31337A73u) s_nv309e.active = 1;
+            return;
+        case 0x02FC: return;
         case 0x0300: s_nv3089.fmt       = data; return;
         case 0x0304: s_nv3089.op        = data; return;
         case 0x0308: s_nv3089.clip_pt   = data; return;
@@ -1650,7 +1783,6 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         }
         return;
     }
-    /* NV0039 / NV309E: not implemented yet -- log first sightings. */
     /* GCM2D_DBG=<N> raises the cap and adds the data word: the fixed 8 showed
      * only that SOMETHING was unhandled, not enough to implement it. */
     static int warned = 0, wcap = -1;
@@ -1764,10 +1896,14 @@ static u32 gcm_ea2io_range(u32 ea, u32* room)
     return 0xFFFFFFFFu;
 }
 
+static volatile char s_spu_blk_lock = 0;
+
 void gcm_forget_spu_blocks(void)
 {
+    while (__atomic_test_and_set(&s_spu_blk_lock, __ATOMIC_ACQUIRE)) {}
     memset(s_spu_blk, 0, sizeof s_spu_blk);
     s_spu_blk_w = 0;
+    __atomic_clear(&s_spu_blk_lock, __ATOMIC_RELEASE);
 }
 
 void gcm_note_spu_put(u32 ea, u32 size)
@@ -1777,15 +1913,21 @@ void gcm_note_spu_put(u32 ea, u32 size)
     u32 io = gcm_ea2io_range(ea, &room);
     if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
 
+    while (__atomic_test_and_set(&s_spu_blk_lock, __ATOMIC_ACQUIRE)) {}
     /* Coalesce with the previous block when an SPU emits one buffer in several
      * transfers -- otherwise only the last fragment is remembered and the
      * walker still starts in the middle of the stream. */
     int prev = (s_spu_blk_w + GCM_SPU_BLK_N - 1) % GCM_SPU_BLK_N;
-    if (s_spu_blk[prev].io_end == io) { s_spu_blk[prev].io_end = io + size; return; }
+    if (s_spu_blk[prev].io_end == io) {
+        s_spu_blk[prev].io_end = io + size;
+        __atomic_clear(&s_spu_blk_lock, __ATOMIC_RELEASE);
+        return;
+    }
 
     s_spu_blk[s_spu_blk_w].io_start = io;
     s_spu_blk[s_spu_blk_w].io_end   = io + size;
     s_spu_blk_w = (s_spu_blk_w + 1) % GCM_SPU_BLK_N;
+    __atomic_clear(&s_spu_blk_lock, __ATOMIC_RELEASE);
 }
 
 /* The recorded block the RSX is being pointed at, or 0xFFFFFFFF.
@@ -2015,6 +2157,11 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
     if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
+}
+
+void cellGcm_fifo_kick_notify(void)
+{
+    if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
 }
 
 
@@ -2485,7 +2632,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         s_tr_off[s_tr_i % GCM_TRACE_N] = s_fifo_getoff;
         s_tr_w[s_tr_i % GCM_TRACE_N] = w;
         s_tr_i++;
-        if (w && ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u || (w & 3u) == 2u)) {
+        if (w && ((w & 0xE0000003u) == 0x20000000u || (w & 0xE0000003u) == 1u || (w & 0xE0000003u) == 2u)) {
             s_cf_off[s_cf_i % 8] = s_fifo_getoff; s_cf_w[s_cf_i % 8] = w; s_cf_i++; }
         /* GCM_WORD_STATS=<secs>: NOP words vs headers vs jumps/calls/returns
          * walked -- a frame that is mostly NOPs is reserved space someone
@@ -2499,8 +2646,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       fprintf(stderr, "[io2ea-mismatch] io=%08X walker_ea=%08X (w=0) alias=%08X w=%08X\n",
                               s_fifo_getoff, ea, alias, vm_read32(alias)); } }
               if (!w) nop++;
-              else if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) jmp++;
-              else if ((w & 3u) == 2u) cal++;
+              else if ((w & 0xE0000003u) == 0x20000000u || (w & 0xE0000003u) == 1u) jmp++;
+              else if ((w & 0xE0000003u) == 2u) cal++;
               else if (w == 0x00020000u) ret++;
               else hdr++;
               extern unsigned long long ps3_ms_now(void);
@@ -2664,7 +2811,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (!gcm_get_eq_put()) vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt); }
             continue;
         }
-        if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+        if ((w & 0xE0000003u) == 2u) {         /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
               s_fifo_calloff = s_fifo_getoff + 4;
@@ -2791,7 +2938,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * which can match, are skipped. Most of a frame's words come this
              * way (God of War HD: about five million vertex-program microcode and
              * constant words a second). */
-            if (!wdiag && count && (subch == 0 || (subch == 1 && !s1_2d)) &&
+            if (!wdiag && count && subch == 0 &&
                 ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
                 const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
                 if (dea) {
@@ -2810,6 +2957,31 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
+                const u32 val = vm_read32(dea);
+                if (m == 0 && subch < 8) s_subch_obj[subch] = val;
+                if (subch == 1 && m == 0x0184u &&
+                    (val == 0xFEED0000u || val == 0xFEED0001u) &&
+                    s_subch_obj[1] != 0x31337000u) {
+                    s_subch_obj[1] = 0x31337303u;
+                }
+                int is_3d = 0;
+                if (subch == 0) {
+                    is_3d = 1;
+                } else if (subch == 1) {
+                    if (s1_2d) {
+                        is_3d = 0;
+                    } else if (s_subch_obj[1] == 0x31337303u ||
+                               s_subch_obj[1] == 0x0039u ||
+                               s_subch_obj[1] == 0x5039u) {
+                        is_3d = (m == 0u || m == 0x0104u || m == 0x0180u ||
+                                 m == 0x0184u || m == 0x0188u ||
+                                 (m >= 0x030Cu && m <= 0x0328u)) ? 0 : 1;
+                    } else {
+                        is_3d = 1;
+                    }
+                } else if (subch <= 6) {
+                    is_3d = (s_subch_obj[subch] == 0x31337000u) ? 1 : 0;
+                }
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
                  * in the 2D engine path and being dropped as unrecognised. It
@@ -2820,24 +2992,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   if (sd < 0) sd = getenv("GCM_SUBCH7") ? 1 : 0;
                   if (sd && subch == 7 && (PS3_LOG_FIRST(s7, 16)))
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
-                              m, vm_read32(dea)); }
+                              m, val); }
                 if (subch == 7 && m == 0x0B00u) {
                     extern void rsx_raise_user_cmd(u32 arg);
-                    rsx_raise_user_cmd(vm_read32(dea));
+                    rsx_raise_user_cmd(val);
                     /* A title that registered its handler with the HLE
                      * cellGcmSetUserHandler has no lv2 interrupt thread
                      * reading that event; its handler runs from the pump.
                      * The `continue` skips the 0xEB00 case below, so queue
                      * it for the pump here. */
-                    if (s_user_handler_opd) cellGcmQueueUserCommand(vm_read32(dea));
+                    if (s_user_handler_opd) cellGcmQueueUserCommand(val);
                     continue;
                 }
-                /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
-                 * The title issues NV4097 methods on it -- 0x1A80..0x1AC0 is
-                 * SET_TEXTURE_OFFSET for units 4-6 -- and the 2D path silently
-                 * discards whatever it does not recognise, so that state never
-                 * reaches the renderer. SET_OBJECT binds are not tracked, which
-                 * is what makes the subchannel-to-engine mapping a guess. */
                 /* GCM_OBJDBG=1: log every SET_OBJECT (method 0). The handle a
                  * title binds to a subchannel is what says which engine that
                  * subchannel drives; comparing subchannel 1 against subchannel 0
@@ -2846,26 +3012,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   if (od < 0) { const char* e = getenv("GCM_OBJDBG"); od = e ? 1 : 0; }
                   if (od && m == 0) {
                       static unsigned seen[8]; static int have[8];
-                      const unsigned h = vm_read32(dea);
-                      if (subch < 8 && (!have[subch] || seen[subch] != h)) {
-                          have[subch] = 1; seen[subch] = h;
+                      if (subch < 8 && (!have[subch] || seen[subch] != val)) {
+                          have[subch] = 1; seen[subch] = val;
                           printf("[GCM-OBJ] subch=%u SET_OBJECT handle=0x%08X%c",
-                                 subch, h, 10); fflush(stdout);
+                                 subch, val, 10); fflush(stdout);
                       } } }
-                /* The subchannel is a binding slot, not an engine selector: a
-                 * title may bind NV4097 to something other than subchannel 0.
-                 * Twisted Metal uses subchannel 1, and caner (canersaka) hit
-                 * the same thing in Yakuza Dead Souls, where SPU-built command
-                 * lists bind NV4097 elsewhere -- his rsx_live_draw.c masks the
-                 * subchannel out of the method for exactly this reason.
-                 *
-                 * gcm_2d_method only ever handles subchannels 2..7 (NV3062,
-                 * NV308A/NV309E, NV3089), so anything arriving on 1 was being
-                 * dropped on the floor -- for this title that included
-                 * SET_SHADER_PROGRAM, leaving one stale fragment program bound
-                 * for every draw in the game. Treat the subchannels the 2D path
-                 * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
-                 */
                 /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
                  * non-zero subchannel -- what each binding slot actually carries. */
                 if (wdiag) { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
@@ -2874,7 +3025,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   /* GCM_VAL_WATCH=<hex>: every FIFO word carrying that value, any method. */
                   { static u32 vw = 1;
                     if (vw == 1) { const char* e = getenv("GCM_VAL_WATCH"); vw = e ? (u32)strtoul(e, 0, 16) : 0; }
-                    if (vw && vm_read32(dea) == vw) {
+                    if (vw && val == vw) {
                         static int vn; if (PS3_LOG_FIRST(vn, 64))
                             printf("[valwatch] subch=%u method=0x%04X = 0x%08X get=0x%X%c", subch, m, vw, s_fifo_getoff, 10);
                     } }
@@ -2882,19 +3033,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   if (sg && !subch && (cm3 == 0x210 || cm3 == 0x214 || cm3 == 0x218 || cm3 == 0x288 || cm3 == 0x28C ||
                                        cm3 == 0x1A20)) {
                       if ((poll++ & 255u) == 0) { FILE* g = fopen(sg, "rb"); open_g = g != NULL; if (g) fclose(g); }
-                      if (open_g) printf("[surfreg] 0x%04X = 0x%08X%c", cm3, vm_read32(dea), 10);
+                      if (open_g) printf("[surfreg] 0x%04X = 0x%08X%c", cm3, val, 10);
                   }
                   if (sg && subch) {
                       if ((poll++ & 255u) == 0) { FILE* g = fopen(sg, "rb"); open_g = g != NULL; if (g) fclose(g); }
-                      if (open_g) printf("[subch] %u 0x%04X = 0x%08X%c", subch, m, vm_read32(dea), 10);
+                      if (open_g) printf("[subch] %u 0x%04X = 0x%08X%c", subch, m, val, 10);
                   } }
-                /* Mirror the whole method stream into the live NV4097->D3D12
-                 * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
-                 * It wants the raw method with its subchannel bits -- it
-                 * canonicalises with & 0x1FFC itself. */
-                if (wdiag) { static int live = -1;
+                /* Mirror 3D + driver methods into the live NV4097->D3D12 engine. */
+                if (wdiag && (is_3d || (subch == 7 && m >= 0x0900u))) {
+                  static int live = -1;
                   if (live < 0) live = rsx_live_draw_enabled();
-                  if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
+                  if (live) rsx_live_draw_method((subch << 13) | m, val);
+                }
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --
                  * what a frame is actually made of when nothing draws. */
@@ -2920,18 +3070,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           memset(cnt, 0, sizeof cnt);
                       } } }
 
-                /* And into the platform-neutral register-file draw engine,
-                 * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
-                 * It wants the raw method with its subchannel bits for the
-                 * same reason the live engine does, and masks them itself. */
-                if (wdiag) { static int eng = -1;
+                /* Forward only 3D subchannels and subch-7 driver methods into
+                 * the register-file draw engine; 2D subchannels (NV0039 on 1,
+                 * NV3062 on 2/3, NV309E/NV308A on 4/5, NV3089 on 6) share
+                 * 0x0300..0x07FC offsets and would clobber 3D blend/alpha/mask
+                 * registers when rsx_draw_engine_method masks & 0x1FFC. */
+                if (wdiag && (is_3d || (subch == 7 && m >= 0x0900u))) {
+                  static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  if (eng) rsx_draw_engine_method((subch << 13) | m, val);
+                }
 
-                /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
-                 * for any run, live engine or not, so the method stream and the
-                 * backend's draw callbacks can be compared in one measurement. */
-                if (wdiag) { static int fdbg = -1;
+                /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. */
+                if (wdiag && is_3d) { static int fdbg = -1;
                   if (fdbg < 0) fdbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
                   if (fdbg) {
                       static long long n_be = 0, n_va = 0, n_ia = 0, tick = 0;
@@ -2950,13 +3101,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * the draw-engine call above does. */
                 { const u32 mfull = (subch << 13) | m;
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
-                    cellGcmQueueUserCommand(vm_read32(dea));
+                    cellGcmQueueUserCommand(val);
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
-                    cellGcmSetFlipCommand(vm_read32(dea) & 7u);
-                } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
+                    cellGcmSetFlipCommand(val & 7u);
+                } else if (is_3d) {
+                    gcm_3d_method(&s_state, m, val, legacy_state_live);
                 } else
-                    gcm_2d_method(subch, m, vm_read32(dea));
+                    gcm_2d_method(subch, m, val);
                 }
             }
             s_fifo_getoff += 4 + count * 4;
@@ -3259,6 +3410,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
          * word at `current` before the jump lands there. */
         atomic_thread_fence(memory_order_release);
         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
+        if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
     }
 
     /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so

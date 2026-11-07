@@ -1054,6 +1054,92 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
 }
 
+int rsx_draw_engine_blit(u32 src_loc, u32 src_off, u32 src_pitch,
+                         u32 sx, u32 sy, u32 sw, u32 sh,
+                         u32 dst_loc, u32 dst_off, u32 dst_pitch,
+                         u32 dx, u32 dy, u32 dw, u32 dh, int linear)
+{
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("RSX_GPU_BLIT");
+        s_on = (e && *e == '0') ? 0 : 1;
+    }
+    if (!s_on || !g.ready || !g.be->color_target_blit) return 0;
+    if (!src_pitch || !dst_pitch || !sw || !sh || !dw || !dh) return 0;
+
+    const u32 src_byte_off = src_off + sy * src_pitch + sx * 4u;
+    u32 sxb = 0, sy_surf = 0;
+    const u32 si = eng_surface_at(src_loc, src_byte_off, src_pitch, &sxb, &sy_surf);
+    if (si == ENG_INVALID || g.surfaces[si].fmt != RSX_BE_FMT_R8G8B8A8 || (sxb & 3u))
+        return 0;
+
+    u32 sx_surf = sxb / 4u;
+    if (sx_surf >= g.surfaces[si].w || sy_surf >= g.surfaces[si].h) return 0;
+    if (sx_surf + sw > g.surfaces[si].w) sw = g.surfaces[si].w - sx_surf;
+    if (sy_surf + sh > g.surfaces[si].h) sh = g.surfaces[si].h - sy_surf;
+    if (!sw || !sh) return 0;
+
+    /* Protect the source slot from LRU eviction if dst allocates a new slot. */
+    g.surfaces[si].last_use = g.frames;
+
+    const u32 dst_byte_off = dst_off + dy * dst_pitch + dx * 4u;
+    u32 dxb = 0, dy_surf = 0, dx_surf = 0;
+    u32 di = eng_surface_at(dst_loc, dst_byte_off, dst_pitch, &dxb, &dy_surf);
+    if (di != ENG_INVALID &&
+        (g.surfaces[di].fmt != RSX_BE_FMT_R8G8B8A8 || (dxb & 3u) ||
+         (dxb / 4u) + dw > g.surfaces[di].w || dy_surf + dh > g.surfaces[di].h)) {
+        di = ENG_INVALID;
+    }
+    if (di != ENG_INVALID) {
+        dx_surf = dxb / 4u;
+    } else {
+        for (u32 b = 0; b < 8; b++) {
+            const eng_display_buffer* db = &g.display_buffers[b];
+            if (db->valid && db->location == dst_loc && db->pitch == dst_pitch &&
+                dst_byte_off >= db->offset &&
+                dst_byte_off < db->offset + db->pitch * db->height) {
+                const u32 d = dst_byte_off - db->offset;
+                if ((d % db->pitch) & 3u) break;
+                dx_surf = (d % db->pitch) / 4u;
+                dy_surf = d / db->pitch;
+                if (dx_surf + dw <= db->width && dy_surf + dh <= db->height) {
+                    di = eng_surface_get(db->location, db->offset, db->width, db->height,
+                                         RSX_BE_FMT_R8G8B8A8, db->pitch, 0);
+                    if (di != ENG_INVALID) g.surfaces[di].pitch = db->pitch;
+                }
+                break;
+            }
+        }
+        if (di == ENG_INVALID) {
+            dx_surf = dx;
+            dy_surf = dy;
+            di = eng_surface_get(dst_loc, dst_off, dx + dw, dy + dh,
+                                 RSX_BE_FMT_R8G8B8A8, dst_pitch, 0);
+            if (di != ENG_INVALID) g.surfaces[di].pitch = dst_pitch;
+        }
+    }
+
+    if (di == ENG_INVALID || di == si || !g.surfaces[si].handle || !g.surfaces[di].handle)
+        return 0;
+    if (g.surfaces[di].fmt != RSX_BE_FMT_R8G8B8A8 ||
+        dx_surf + dw > g.surfaces[di].w || dy_surf + dh > g.surfaces[di].h)
+        return 0;
+
+    g.be->color_target_blit(g.be->user,
+                            g.surfaces[si].handle, sx_surf, sy_surf, sw, sh,
+                            g.surfaces[di].handle, dx_surf, dy_surf, dw, dh,
+                            linear);
+    g.surfaces[di].color_serial = ++g.write_serial;
+    g.surfaces[di].guest_dirty  = 1;
+    g.surfaces[di].last_use     = g.frames;
+    if (eng_coherence_log())
+        fprintf(stderr, "[rsx engine] gpu_blit %u:0x%08X (%u,%u %ux%u) -> %u:0x%08X (%u,%u %ux%u)%s\n",
+                src_loc, g.surfaces[si].offset, sx_surf, sy_surf, sw, sh,
+                dst_loc, g.surfaces[di].offset, dx_surf, dy_surf, dw, dh,
+                linear ? " linear" : "");
+    return 1;
+}
+
 static u32 eng_current_surface(void)
 {
     u32 slots[RSX_BE_MAX_COLOR_TARGETS];

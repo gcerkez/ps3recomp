@@ -2046,6 +2046,7 @@ extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* r
 {
     barrier_watch_hit(ea, val, width, ra);
 }
+extern "C" void cellGcm_fifo_kick_notify(void);
 void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT detector: does this byte-write turn its word into the hunted truncated value? */
@@ -2066,6 +2067,10 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
 #endif
     { uint32_t _v = v;
       v = __builtin_bswap32(v); VM_WRITE_COH(a, &v, 4);
+      /* Wake the RSX FIFO walker immediately on ctrl->put flushes so mid-frame
+       * PSGL/libgcm label waits do not sit through the host ticker's sleep. */
+      if (__builtin_expect((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2000u), 0))
+          cellGcm_fifo_kick_notify();
       /* Raw SPU problem state: run control, mailboxes and signal notification
        * have side effects. The plain store above still happens -- the registers
        * are guest memory and the PPU reads most of them straight back. */
