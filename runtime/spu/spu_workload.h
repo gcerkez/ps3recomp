@@ -119,6 +119,10 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
  * chain's jobs are ordered by its own NEXT/CALL/RET commands, so the jobchain
  * thread is the right place to run them. Returns 1 if a lifted image matched
  * and ran, 0 if none is registered for this binary. */
+int spu_workload_resolve_job(const uint8_t* image, uint32_t image_size,
+                             spu_lifted_entry_fn* fn_out, int* image_id_out);
+void spurs_job_set_spu_num(uint32_t n);
+
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size);
 

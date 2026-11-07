@@ -433,7 +433,7 @@ static int spu_mfc_cache_enabled(void)
     int value = atomic_load_explicit(&cached, memory_order_relaxed);
     if (!value) {
         const char* flag = getenv("SPU_MFC_LOOKUP_CACHE");
-        value = flag && !strcmp(flag, "1") ? 2 : 1;
+        value = flag && !strcmp(flag, "0") ? 1 : 2;
         atomic_store_explicit(&cached, value, memory_order_relaxed);
     }
     return value == 2;
@@ -518,6 +518,28 @@ void spu_mfc_release(spu_context* ctx)
         break;
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+}
+
+void spu_mfc_reset(spu_context* ctx)
+{
+    if (!ctx) return;
+    if (spu_mfc_cache_enabled()) {
+        uint64_t generation = atomic_load_explicit(&s_mfc_cache_generation, memory_order_acquire);
+        if (generation != UINT64_MAX && generation == s_mfc_recent.generation &&
+            ctx == s_mfc_recent.ctx) {
+            mfc_engine_init(s_mfc_recent.engine);
+            return;
+        }
+    }
+    AcquireSRWLockShared(&s_mfc_claim_lock);
+    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+        if (slot->ctx == ctx) {
+            mfc_engine_init(&slot->mfc);
+            if (spu_mfc_cache_enabled()) spu_mfc_cache_remember(ctx, &slot->mfc);
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&s_mfc_claim_lock);
 }
 
 /* Exit safety net for contexts unwound off a departing thread's stack.
@@ -2902,12 +2924,23 @@ void spu_indirect_branch(spu_context* ctx)
         if (p0 + 3 < SPU_LS_SIZE) {
             uint32_t w = ((uint32_t)ctx->ls[p0] << 24) | ((uint32_t)ctx->ls[p0+1] << 16) |
                          ((uint32_t)ctx->ls[p0+2] << 8) | ctx->ls[p0+3];
+            if (w == 0u && p0 >= 0x1000u && p0 < 0x3E000u && ctx->host_depth > 0) {
+                /* Unloaded external PIC plugin buffer (e.g. MultiStream calling
+                 * /dev_flash/sys/external/flashMP3.pic): return 0 to the caller
+                 * instead of treating zeroed buffer bytes as a fatal exit. */
+                static int _unp = 0;
+                if (PS3_LOG_FIRST(_unp, 8))
+                    fprintf(stderr, "[spu] img=%d stub-return 0 from zeroed PIC buffer at LS 0x%05X (lr=0x%05X)\n",
+                            ctx->image_id, p0, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+                ctx->gpr[3]._u32[0] = 0;
+                SPU_RET(ctx);
+            }
             if ((w >> 21) == 0u) {                 /* stop / stopd */
                 ctx->stop_code = w & 0x3FFFu;
                 static int _n = 0;
                 if (PS3_LOG_FIRST(_n, 8))
-                    fprintf(stderr, "[spu] img=%d exit: synthesised stop 0x%04X at LS 0x%05X\n",
-                            ctx->image_id, ctx->stop_code, p0);
+                    fprintf(stderr, "[spu] img=%d exit: synthesised stop 0x%04X at LS 0x%05X (lr=0x%05X)\n",
+                            ctx->image_id, ctx->stop_code, p0, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
                 spu_halt(ctx);
                 return;
             }

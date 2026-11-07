@@ -246,6 +246,9 @@ s32 _cellSpursTasksetAttribute2Initialize(u64 attr_ea, u32 revision);
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset);
 s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset);
 s32 cellSpursJoinTaskset(CellSpursTaskset* taskset);
+s32 cellSpursAddUrgentCommand(u64 jc_ea, u64 cmd);
+s32 cellSpursAddUrgentCall(u64 jc_ea, u64 cmd_list_ea);
+s32 cellSpursRunJobChain(u64 jc_ea);
 
 s32 cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr);
 s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,

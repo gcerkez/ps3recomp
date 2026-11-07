@@ -2533,7 +2533,8 @@ s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
 s32 _cellSpursSendSignal(void* taskset, u32 taskId)
 {
     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
-    printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
+    if (ps3_log_verbose())
+        printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
     /* Real delivery now that SPU tasks execute (comment was stale). */
     if (taskset_ea) spu_taskset_signal_task(taskset_ea, taskId);
     return CELL_OK;
@@ -2573,9 +2574,58 @@ static struct {
     u32 entry_ea;     /* first command word EA */
     u16 size_desc;
     u16 max_grab;
+    u8  max_cont;
     int run_count;
-    volatile long running;   /* 1 while a host thread walks this chain */
+    u64 urgent_cmd[4];
+    volatile char urgent_lock;
+    volatile long shutdown;     /* 1 after cellSpursShutdownJobChain */
+    volatile long running;      /* 1 while a host thread walks this chain */
+    volatile long thread_live;  /* 1 once persistent jc_thread is spawned */
+    HANDLE wake_ev;
+    HANDLE done_ev;
 } s_jobchains[MAX_JOBCHAINS];
+
+static void jc_urgent_lock(int slot)
+{
+    while (__atomic_test_and_set(&s_jobchains[slot].urgent_lock, __ATOMIC_ACQUIRE)) {
+#ifdef _WIN32
+        Sleep(0);
+#else
+        usleep(0);
+#endif
+    }
+}
+
+static void jc_urgent_unlock(int slot)
+{
+    __atomic_clear(&s_jobchains[slot].urgent_lock, __ATOMIC_RELEASE);
+}
+
+static u64 jc_pop_urgent(int slot)
+{
+    u64 cmd = 0;
+    if (slot < 0 || slot >= MAX_JOBCHAINS) return 0;
+    jc_urgent_lock(slot);
+    if (s_jobchains[slot].urgent_cmd[0] != 0) {
+        cmd = s_jobchains[slot].urgent_cmd[0];
+        s_jobchains[slot].urgent_cmd[0] = s_jobchains[slot].urgent_cmd[1];
+        s_jobchains[slot].urgent_cmd[1] = s_jobchains[slot].urgent_cmd[2];
+        s_jobchains[slot].urgent_cmd[2] = s_jobchains[slot].urgent_cmd[3];
+        s_jobchains[slot].urgent_cmd[3] = 0;
+    }
+    jc_urgent_unlock(slot);
+    return cmd;
+}
+
+static int jc_has_urgent(int slot)
+{
+    int has = 0;
+    if (slot < 0 || slot >= MAX_JOBCHAINS) return 0;
+    jc_urgent_lock(slot);
+    has = (s_jobchains[slot].urgent_cmd[0] != 0);
+    jc_urgent_unlock(slot);
+    return has;
+}
 
 static void jc_dump_commands(const char* tag, u32 ea, int max_words)
 {
@@ -2632,7 +2682,7 @@ s32 cellSpursJobChainAttributeSetName(u64 attr_ea, u64 name_ea)
 
 /* Register (or re-register) a job chain handle. Shared by both Create forms. */
 static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
-                       const char* who)
+                       u32 max_cont, const char* who)
 {
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == jc_ea) {
@@ -2640,7 +2690,16 @@ static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
             s_jobchains[i].entry_ea  = entry_ea;
             s_jobchains[i].size_desc = size_desc;
             s_jobchains[i].max_grab  = max_grab;
+            s_jobchains[i].max_cont  = (max_cont >= 1u && max_cont <= 6u) ? (u8)max_cont : 6u;
             s_jobchains[i].run_count = 0;
+            s_jobchains[i].shutdown  = 0;
+            if (!s_jobchains[i].wake_ev)
+                s_jobchains[i].wake_ev = CreateEvent(NULL, FALSE, FALSE, NULL);
+            if (!s_jobchains[i].done_ev)
+                s_jobchains[i].done_ev = CreateEvent(NULL, TRUE, TRUE, NULL);
+            jc_urgent_lock(i);
+            memset(s_jobchains[i].urgent_cmd, 0, sizeof(s_jobchains[i].urgent_cmd));
+            jc_urgent_unlock(i);
             return CELL_OK;
         }
     }
@@ -2651,9 +2710,10 @@ static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
 s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
 {
     if (!spurs_ea || !jc_ea || !attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-    u32 entry   = vm_read32((u32)attr_ea + JCATTR_ENTRY);
-    u32 sd_mg   = vm_read32((u32)attr_ea + JCATTR_SIZE_DESC);
-    u32 name_ea = vm_read32((u32)attr_ea + JCATTR_NAME);
+    u32 entry    = vm_read32((u32)attr_ea + JCATTR_ENTRY);
+    u32 sd_mg    = vm_read32((u32)attr_ea + JCATTR_SIZE_DESC);
+    u32 max_cont = vm_read32((u32)attr_ea + JCATTR_MAX_CONT);
+    u32 name_ea  = vm_read32((u32)attr_ea + JCATTR_NAME);
 
     {   /* Layout ground truth (same rationale as AddWorkloadWA). */
         static int _n = 0;
@@ -2670,12 +2730,12 @@ s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
         }
         _n++;
     }
-    printf("[cellSpurs] CreateJobChainWithAttribute(jc=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u name=\"%s\")\n",
-           (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
+    printf("[cellSpurs] CreateJobChainWithAttribute(jc=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u maxCont=%u name=\"%s\")\n",
+           (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu, max_cont,
            name_ea ? (const char*)(vm_base + name_ea) : "-");
 
     return jc_register((u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
-                       "CreateJobChainWithAttribute");
+                       max_cont, "CreateJobChainWithAttribute");
 }
 
 /* cellSpursCreateJobChain -- the no-attribute form, and the one the WWS job
@@ -2710,7 +2770,7 @@ s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
             jc_dump_commands("CreateJobChain", (u32)entry_ea, 16);
     }
     return jc_register((u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
-                       (u16)maxGrabbedJob, "CreateJobChain");
+                       (u16)maxGrabbedJob, maxContention, "CreateJobChain");
 }
 
 /* ---------------------------------------------------------------------------
@@ -3000,7 +3060,230 @@ static void jc_signal_done(u32 jc_ea, int job_index)
     }
 }
 
-static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+/* ---------------------------------------------------------------------------
+ * Parallel JOBLIST worker pool (virtual SPUs 0..5, bounded by maxContention)
+ *
+ * A CELL_SPURS_JOB_COMMAND_JOBLIST hands jm2 an array of independent jobs to
+ * scatter across up to maxContention SPUs before the following SYNC barrier.
+ * Resolving the lifted binary once per JOBLIST and running across persistent
+ * worker threads (jc_thread = SPU 0, helpers 0..4 = SPUs 1..5) cuts 1200+
+ * jobs/frame from ~250 ms single-threaded down to multi-core speed while
+ * keeping hardware-faithful distinct SPU IDs in cellSpursGetCurrentSpuId.
+ * -----------------------------------------------------------------------*/
+#define JL_MAX_HELPERS 5
+
+static struct {
+    u32                 ea_jobs;
+    u32                 num_jobs;
+    u32                 sz_desc;
+    u32                 ea_bin0;
+    u32                 size_bin0;
+    spu_lifted_entry_fn fn0;
+    int                 img0;
+    int                 slot;
+    volatile u32        next_idx;
+} s_jl_batch;
+
+static volatile char s_jl_pool_busy = 0;
+static volatile int  s_jl_workers_ready = 0;
+static u32           s_jl_active_mask = 0;
+#ifdef _WIN32
+static SRWLOCK            s_jl_mtx     = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_jl_wake_cv = CONDITION_VARIABLE_INIT;
+static CONDITION_VARIABLE s_jl_done_cv = CONDITION_VARIABLE_INIT;
+#else
+static pthread_mutex_t    s_jl_mtx     = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t     s_jl_wake_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t     s_jl_done_cv = PTHREAD_COND_INITIALIZER;
+#endif
+
+static void jl_exec_one(u32 job_ea, u32 sz_desc,
+                        u32 ea_bin0, u32 size_bin0,
+                        spu_lifted_entry_fn fn0, int img0)
+{
+    u64 ea_bin_raw = vm_read64(job_ea + JH_EA_BINARY);
+    u32 ea_bin     = (u32)(ea_bin_raw & ~7ull);
+    u32 size_bin   = ((vm_read32(job_ea + JH_SIZE_BINARY) >> 16) & 0xFFFFu) << 4;
+    if (!ea_bin || !size_bin || ea_bin >= 0x10000000u) return;
+    if (fn0 && ea_bin == ea_bin0 && size_bin == size_bin0) {
+        spu_run_spurs_job(fn0, img0, job_ea, sz_desc);
+    } else {
+        spu_workload_dispatch_job(vm_base + ea_bin, size_bin, job_ea, sz_desc);
+    }
+}
+
+static void jl_worker_drain(void)
+{
+    for (;;) {
+        if (s_jobchains[s_jl_batch.slot].shutdown) break;
+        u32 j = __atomic_fetch_add(&s_jl_batch.next_idx, 2u, __ATOMIC_RELAXED);
+        if (j >= s_jl_batch.num_jobs) break;
+        u32 end = j + 2u;
+        if (end > s_jl_batch.num_jobs) end = s_jl_batch.num_jobs;
+        for (; j < end; j++) {
+            jl_exec_one(s_jl_batch.ea_jobs + j * s_jl_batch.sz_desc,
+                        s_jl_batch.sz_desc,
+                        s_jl_batch.ea_bin0, s_jl_batch.size_bin0,
+                        s_jl_batch.fn0, s_jl_batch.img0);
+        }
+    }
+}
+
+static DWORD WINAPI jl_helper_thread(LPVOID p)
+{
+    int k = (int)(intptr_t)p; /* 0..4 -> virtual SPU 1..5 */
+    ps3_thread_name("spurs jw %d", k + 1);
+    spurs_job_set_spu_num((uint32_t)(k + 1));
+    const u32 bit = 1u << (unsigned)k;
+    for (;;) {
+#ifdef _WIN32
+        AcquireSRWLockExclusive(&s_jl_mtx);
+        while (!(s_jl_active_mask & bit))
+            SleepConditionVariableSRW(&s_jl_wake_cv, &s_jl_mtx, INFINITE, 0);
+        ReleaseSRWLockExclusive(&s_jl_mtx);
+#else
+        pthread_mutex_lock(&s_jl_mtx);
+        while (!(s_jl_active_mask & bit))
+            pthread_cond_wait(&s_jl_wake_cv, &s_jl_mtx);
+        pthread_mutex_unlock(&s_jl_mtx);
+#endif
+        jl_worker_drain();
+#ifdef _WIN32
+        AcquireSRWLockExclusive(&s_jl_mtx);
+        s_jl_active_mask &= ~bit;
+        if (s_jl_active_mask == 0)
+            WakeConditionVariable(&s_jl_done_cv);
+        ReleaseSRWLockExclusive(&s_jl_mtx);
+#else
+        pthread_mutex_lock(&s_jl_mtx);
+        s_jl_active_mask &= ~bit;
+        if (s_jl_active_mask == 0)
+            pthread_cond_signal(&s_jl_done_cv);
+        pthread_mutex_unlock(&s_jl_mtx);
+#endif
+    }
+    return 0;
+}
+
+static void jl_ensure_workers(void)
+{
+    if (__atomic_load_n(&s_jl_workers_ready, __ATOMIC_ACQUIRE)) return;
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&s_jl_mtx);
+#else
+    pthread_mutex_lock(&s_jl_mtx);
+#endif
+    if (!s_jl_workers_ready) {
+        for (int k = 0; k < JL_MAX_HELPERS; k++) {
+            HANDLE th = CreateThread(NULL, 1u << 20, jl_helper_thread, (LPVOID)(intptr_t)k, 0, NULL);
+            if (th) CloseHandle(th);
+        }
+        __atomic_store_n(&s_jl_workers_ready, 1, __ATOMIC_RELEASE);
+    }
+#ifdef _WIN32
+    ReleaseSRWLockExclusive(&s_jl_mtx);
+#else
+    pthread_mutex_unlock(&s_jl_mtx);
+#endif
+}
+
+static void jl_run_joblist(int slot, u32 jc_ea, u32 ea_jobs, u32 num_jobs,
+                           u32 sz_desc, int* jobs_io)
+{
+    if (num_jobs == 0) return;
+    { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
+
+    /* Resolve the batch's primary job binary once instead of hashing 177 KB
+     * on every descriptor. Preserve the initial 8-job header diagnostic log. */
+    u32 job0_ea    = ea_jobs;
+    u32 ea_bin0    = (u32)(vm_read64(job0_ea + JH_EA_BINARY) & ~7ull);
+    u32 size_bin0  = ((vm_read32(job0_ea + JH_SIZE_BINARY) >> 16) & 0xFFFFu) << 4;
+    spu_lifted_entry_fn fn0 = NULL;
+    int img0 = 0;
+    if (ea_bin0 && size_bin0 && ea_bin0 < 0x10000000u)
+        spu_workload_resolve_job(vm_base + ea_bin0, size_bin0, &fn0, &img0);
+
+    static int s_env_threads = -1;
+    if (s_env_threads < 0) {
+        const char* e = getenv("SPURS_JOB_THREADS");
+        int v = (e && *e) ? atoi(e) : 0;
+        if (v < 0) v = 0;
+        if (v > 6) v = 6;
+        s_env_threads = v;
+    }
+    int n_workers = s_env_threads ? s_env_threads : (int)s_jobchains[slot].max_cont;
+    if (n_workers < 1) n_workers = 1;
+    if (n_workers > 6) n_workers = 6;
+    if ((u32)n_workers > (num_jobs + 1u) / 2u)
+        n_workers = (int)((num_jobs + 1u) / 2u);
+
+    int base_idx = *jobs_io;
+    if (n_workers > 1 && num_jobs >= 4 && fn0 != NULL &&
+        !__atomic_test_and_set(&s_jl_pool_busy, __ATOMIC_ACQUIRE)) {
+        jl_ensure_workers();
+        int n_helpers = n_workers - 1;
+        if (n_helpers > JL_MAX_HELPERS) n_helpers = JL_MAX_HELPERS;
+
+        s_jl_batch.ea_jobs   = ea_jobs;
+        s_jl_batch.num_jobs  = num_jobs;
+        s_jl_batch.sz_desc   = sz_desc;
+        s_jl_batch.ea_bin0   = ea_bin0;
+        s_jl_batch.size_bin0 = size_bin0;
+        s_jl_batch.fn0       = fn0;
+        s_jl_batch.img0      = img0;
+        s_jl_batch.slot      = slot;
+        __atomic_store_n(&s_jl_batch.next_idx, 0u, __ATOMIC_RELAXED);
+
+#ifdef _WIN32
+        AcquireSRWLockExclusive(&s_jl_mtx);
+        s_jl_active_mask = (1u << (unsigned)n_helpers) - 1u;
+        WakeAllConditionVariable(&s_jl_wake_cv);
+        ReleaseSRWLockExclusive(&s_jl_mtx);
+#else
+        pthread_mutex_lock(&s_jl_mtx);
+        s_jl_active_mask = (1u << (unsigned)n_helpers) - 1u;
+        pthread_cond_broadcast(&s_jl_wake_cv);
+        pthread_mutex_unlock(&s_jl_mtx);
+#endif
+
+        jl_worker_drain();
+
+#ifdef _WIN32
+        AcquireSRWLockExclusive(&s_jl_mtx);
+        while (s_jl_active_mask != 0)
+            SleepConditionVariableSRW(&s_jl_done_cv, &s_jl_mtx, INFINITE, 0);
+        ReleaseSRWLockExclusive(&s_jl_mtx);
+#else
+        pthread_mutex_lock(&s_jl_mtx);
+        while (s_jl_active_mask != 0)
+            pthread_cond_wait(&s_jl_done_cv, &s_jl_mtx);
+        pthread_mutex_unlock(&s_jl_mtx);
+#endif
+
+        __atomic_clear(&s_jl_pool_busy, __ATOMIC_RELEASE);
+
+        *jobs_io = base_idx + (int)num_jobs;
+        if (s_spurs_event_queue_n > 0) {
+            for (u32 j = 0; j < num_jobs; j++)
+                jc_signal_done(jc_ea, base_idx + (int)j);
+        }
+        return;
+    }
+
+    for (u32 j = 0; j < num_jobs; j++) {
+        if (s_jobchains[slot].shutdown) break;
+        u32 this_job = ea_jobs + j * sz_desc;
+        int idx = (*jobs_io)++;
+        if (fn0)
+            jl_exec_one(this_job, sz_desc, ea_bin0, size_bin0, fn0, img0);
+        else
+            jc_run_one_job(this_job, idx, sz_desc);
+        if (s_spurs_event_queue_n > 0)
+            jc_signal_done(jc_ea, idx);
+    }
+}
+
+static void jc_execute(int slot, u32 entry_ea, u32 jc_ea, u32 size_desc)
 {
     u32 pc = entry_ea, ret_pc = 0;
     int jobs = 0;
@@ -3014,6 +3297,37 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
     int idle = 0;
     for (;; idle++) {
         if (idle > 4096) break;
+        if (s_jobchains[slot].shutdown) return;
+
+        /* Check for urgent commands before executing the next command word */
+        u64 ucmd = jc_pop_urgent(slot);
+        if (ucmd != 0) {
+            u32 uop = (u32)(ucmd & 7);
+            { static int _un = 0;
+              if (PS3_LOG_FIRST(_un, 16))
+                  printf("[cellSpurs] chain 0x%08X: urgent command 0x%016llX (op=%u pc=0x%08X)\n",
+                         jc_ea, (unsigned long long)ucmd, uop, pc); }
+            if (uop == 1) { /* RESET_PC */
+                pc = (u32)(ucmd & ~7ull);
+                idle = 0;
+                continue;
+            }
+            if (uop == 4) { /* CALL */
+                ret_pc = pc;
+                pc = (u32)(ucmd & ~7ull);
+                idle = 0;
+                continue;
+            }
+            if (uop == 0) { /* JOB */
+                { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
+                int idx = jobs++;
+                jc_run_one_job((u32)(ucmd & ~7ull), idx, size_desc);
+                idle = 0;
+                jc_signal_done(jc_ea, idx);
+                continue;
+            }
+        }
+
         u64 cmd = vm_read64(pc);
         u32 op  = (u32)(cmd & 7);
         u32 ext = (u32)(cmd & 127);
@@ -3034,9 +3348,27 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
         if (op == 3) { pc = (u32)(cmd & ~7ull); continue; }   /* NEXT     */
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
+        if (op == 6) {                                        /* JOBLIST  */
+            u32 jl_ea = (u32)(cmd & ~7ull);
+            u32 num_jobs = vm_read32(jl_ea);
+            u32 sz_desc = vm_read32(jl_ea + 4);
+            u32 ea_jobs = (u32)vm_read64(jl_ea + 8);
+            if (sz_desc == 0) sz_desc = size_desc;
+            { static int _n = 0;
+              if (PS3_LOG_FIRST(_n, 8))
+                  printf("[cellSpurs] chain 0x%08X: JOBLIST @0x%08X: %u job(s) sz=%u ea=0x%08X\n",
+                         jc_ea, jl_ea, num_jobs, sz_desc, ea_jobs); }
+            if (num_jobs > 0) {
+                jl_run_joblist(slot, jc_ea, ea_jobs, num_jobs, sz_desc, &jobs);
+                idle = 0;
+            }
+            pc += 8; continue;
+        }
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
-                printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
+                { static int _en = 0;
+                  if (PS3_LOG_FIRST(_en, 16))
+                      printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs); }
                 if (jobs) jc_signal_done(jc_ea, jobs - 1);
                 return;
             }
@@ -3055,7 +3387,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
             pc += 8; continue;
         }
         /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /
-         * FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
+         * FLUSH(5) / SET_LABEL */
         pc += 8;
     }
     printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "
@@ -3067,19 +3399,40 @@ static DWORD WINAPI jc_thread(LPVOID p)
 {
     int slot = (int)(intptr_t)p;
     ps3_thread_name("spurs jc %d", slot);
-    /* TIMING PROBE (SPURS_JC_DELAY=ms): the real jm2 chain walker is async and
-     * picks up jobs as the PPU appends them + fills their descriptors. Our walk
-     * is one-shot; if it reads descriptors before the PPU populates the I/O
-     * (n_dma=0, empty ioBuffer), deferring the walk should let real I/O appear.
-     * Confirms timing-vs-never before committing to the async rewrite. */
-    { const char* d = getenv("SPURS_JC_DELAY");
-      if (d && *d) Sleep((unsigned)atoi(d)); }
-    jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
-               s_jobchains[slot].size_desc);
-    s_jobchains[slot].running = 0;
-    /* Tell the application the chain is done. Without this the walk finishes
-     * in silence and a thread waiting on the attached queue never runs again. */
-    jc_signal_done(s_jobchains[slot].jc_ea, -1);
+    spurs_job_set_spu_num(0);
+    int delay_ms = -1;
+    for (;;) {
+        while (!__atomic_load_n(&s_jobchains[slot].running, __ATOMIC_ACQUIRE)) {
+            if (s_jobchains[slot].wake_ev)
+                WaitForSingleObject(s_jobchains[slot].wake_ev, 50);
+            else
+                Sleep(1);
+        }
+        /* TIMING PROBE (SPURS_JC_DELAY=ms): the real jm2 chain walker is async and
+         * picks up jobs as the PPU appends them + fills their descriptors. Our walk
+         * is one-shot; if it reads descriptors before the PPU populates the I/O
+         * (n_dma=0, empty ioBuffer), deferring the walk should let real I/O appear.
+         * Confirms timing-vs-never before committing to the async rewrite. */
+        if (delay_ms < 0) {
+            const char* d = getenv("SPURS_JC_DELAY");
+            delay_ms = (d && *d) ? atoi(d) : 0;
+        }
+        if (delay_ms > 0) Sleep((unsigned)delay_ms);
+
+        for (;;) {
+            jc_execute(slot, s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
+                       s_jobchains[slot].size_desc);
+            /* Tell the application the chain pass is done before dropping running. */
+            jc_signal_done(s_jobchains[slot].jc_ea, -1);
+            __atomic_store_n(&s_jobchains[slot].running, 0, __ATOMIC_SEQ_CST);
+            if (s_jobchains[slot].done_ev) SetEvent(s_jobchains[slot].done_ev);
+            if (s_jobchains[slot].shutdown || !jc_has_urgent(slot))
+                break;
+            if (_InterlockedCompareExchange(&s_jobchains[slot].running, 1, 0) != 0)
+                break;
+            if (s_jobchains[slot].done_ev) ResetEvent(s_jobchains[slot].done_ev);
+        }
+    }
     return 0;
 }
 
@@ -3109,12 +3462,23 @@ static s32 jc_start(u64 jc_ea, const char* who)
                    who, (u32)jc_ea, s_jobchains[i].run_count, s_jobchains[i].entry_ea);
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
-        if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
+        if (s_off || !s_jobchains[i].entry_ea || s_jobchains[i].shutdown) return CELL_OK;
         /* Coalesce: a chain already being walked must not start twice. */
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
-            HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
-            if (th) CloseHandle(th);
-            else s_jobchains[i].running = 0;
+            if (s_jobchains[i].done_ev) ResetEvent(s_jobchains[i].done_ev);
+            if (_InterlockedCompareExchange(&s_jobchains[i].thread_live, 1, 0) == 0) {
+                HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
+                if (th) {
+                    CloseHandle(th);
+                    if (s_jobchains[i].wake_ev) SetEvent(s_jobchains[i].wake_ev);
+                } else {
+                    s_jobchains[i].thread_live = 0;
+                    s_jobchains[i].running = 0;
+                    if (s_jobchains[i].done_ev) SetEvent(s_jobchains[i].done_ev);
+                }
+            } else {
+                if (s_jobchains[i].wake_ev) SetEvent(s_jobchains[i].wake_ev);
+            }
         }
         return CELL_OK;
     }
@@ -3127,6 +3491,36 @@ s32 cellSpursRunJobChain(u64 jc_ea)
     return jc_start(jc_ea, "RunJobChain");
 }
 
+s32 cellSpursAddUrgentCommand(u64 jc_ea, u64 cmd)
+{
+    if (!jc_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    u32 ea = (u32)jc_ea;
+    static int _n = 0;
+    if (PS3_LOG_FIRST(_n, 8)) {
+        printf("[cellSpurs] AddUrgentCommand(jc=0x%08X, cmd=0x%016llX)\n",
+               ea, (unsigned long long)cmd);
+    }
+    for (int slot = 0; slot < MAX_JOBCHAINS; slot++) {
+        if (s_jobchains[slot].jc_ea != ea) continue;
+        jc_urgent_lock(slot);
+        for (int i = 0; i < 4; i++) {
+            if (s_jobchains[slot].urgent_cmd[i] == 0) {
+                s_jobchains[slot].urgent_cmd[i] = cmd;
+                break;
+            }
+        }
+        jc_urgent_unlock(slot);
+        return CELL_OK;
+    }
+    return CELL_OK;
+}
+
+s32 cellSpursAddUrgentCall(u64 jc_ea, u64 cmd_list_ea)
+{
+    if (!jc_ea || !cmd_list_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    return cellSpursAddUrgentCommand(jc_ea, (cmd_list_ea & ~7ull) | 4);
+}
+
 /* cellSpursShutdownJobChain(CellSpursJobChain*) -- the other half of the pair.
  *
  * A title that starts a chain with Run/Kick ends it with Shutdown, then blocks
@@ -3135,18 +3529,16 @@ s32 cellSpursRunJobChain(u64 jc_ea)
  * r3, so the caller reads a garbage result for "did the shutdown take?" and a
  * title that checks it can decide the subsystem failed and tear itself down.
  *
- * Clearing `running` is what makes the pair honest: the host walker stops
- * grabbing new work, and the Join that follows has something true to observe.
- * Found in Tokyo Jungle, whose sound engine shuts its chain down during init
- * and then reports "failed to recv data from SPU" when the handshake does not
- * complete. */
+ * Setting `shutdown` tells the walker to stop grabbing new work and exit, while
+ * `running` stays 1 until `jc_thread` actually finishes so Join waits honestly. */
 s32 cellSpursShutdownJobChain(u64 jc_ea)
 {
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea);
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea == (u32)jc_ea) {
-            s_jobchains[i].running = 0;   /* stop the walker; Join can now succeed */
+            s_jobchains[i].shutdown = 1;
+            __sync_synchronize();
             return CELL_OK;
         }
     }
@@ -3169,12 +3561,16 @@ s32 cellSpursJoinJobChain(u64 jc_ea)
      * so that frame's data was never written at all. */
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
-        while (s_jobchains[i].running) {
+        while (__atomic_load_n(&s_jobchains[i].running, __ATOMIC_ACQUIRE)) {
+            if (s_jobchains[i].done_ev) {
+                WaitForSingleObject(s_jobchains[i].done_ev, 1);
+            } else {
 #ifdef _WIN32
-            Sleep(0);
+                Sleep(1);
 #else
-            usleep(0);
+                usleep(50);
 #endif
+            }
         }
     }
     return CELL_OK;

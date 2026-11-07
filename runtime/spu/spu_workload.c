@@ -1024,6 +1024,21 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
 #endif
 
+int spu_workload_resolve_job(const uint8_t* image, uint32_t image_size,
+                             spu_lifted_entry_fn* fn_out, int* image_id_out)
+{
+    if (!image || image_size == 0) return 0;
+    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
+    for (unsigned i = 0; i < s_registry_count; i++) {
+        if (s_registry[i].fp == fp) {
+            if (fn_out) *fn_out = s_registry[i].fn;
+            if (image_id_out) *image_id_out = s_registry[i].image_id;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size)
 {
