@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #include "ps3emu/log_first.h"
 
@@ -3481,6 +3482,34 @@ static void sink_end(void* user, const rsx_dispatch* r)
         xf[4] = (vp.translate[0] - Wv * 0.5f) / (Wv * 0.5f);
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
+    }
+    static int s_vp_logged = 0;
+    static int s_vp_env = -1;
+    if (s_vp_env < 0) s_vp_env = getenv("PS3RECOMP_VP_DIAG") ? 1 : 0;
+    if (s_vp_env && s_vp_logged < 20) {
+        s_vp_logged++;
+        fprintf(stderr, "[RSX_VP_MATH #%d] clip=%ux%u aa=%ux%u surf=%ux%u g=%ux%u trans=(%.1f,%.1f) scale=(%.1f,%.1f) -> xf=(%.4f,%.4f, offset=%.4f,%.4f)\n",
+               s_vp_logged, sf.clip_w, sf.clip_h, sf.aa_sx, sf.aa_sy,
+               target < g.n_surfaces ? g.surfaces[target].w : 0,
+               target < g.n_surfaces ? g.surfaces[target].h : 0,
+               g.width, g.height,
+               vp.translate[0], vp.translate[1],
+               vp.scale[0], vp.scale[1],
+               xf[0], xf[1], xf[4], xf[5]);
+    }
+    if (s_vp_env && (fabsf(xf[4]) > 0.01f || fabsf(xf[5]) > 0.01f || fabsf(xf[0] - 1.0f) > 0.01f)) {
+        static int s_vp_shifted = 0;
+        if (s_vp_shifted < 20) {
+            s_vp_shifted++;
+            fprintf(stderr, "[RSX_VP_SHIFTED #%d] clip=%ux%u surf=%ux%u g=%ux%u trans=(%.1f,%.1f) scale=(%.1f,%.1f) -> xf=(%.4f,%.4f, offset=%.4f,%.4f)\n",
+                   s_vp_shifted, sf.clip_w, sf.clip_h,
+                   target < g.n_surfaces ? g.surfaces[target].w : 0,
+                   target < g.n_surfaces ? g.surfaces[target].h : 0,
+                   g.width, g.height,
+                   vp.translate[0], vp.translate[1],
+                   vp.scale[0], vp.scale[1],
+                   xf[0], xf[1], xf[4], xf[5]);
+        }
     }
     memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
     memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
