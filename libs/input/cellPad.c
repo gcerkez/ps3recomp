@@ -960,6 +960,14 @@ static void pad_poll_backend(void)
     pad_poll_sdl2();
 #endif
     pad_poll_keyboard(s_host_state[0].connected);
+    /* PAD_FILE2 also makes port 1 a virtual pad (like port 0): a title
+     * that discovers pads through cellPadGetInfo never polls a port it
+     * thinks is empty, so the file's presses would never be read. Set
+     * before pad_track_assign so the assignment tracker treats it like
+     * a pad that was plugged in before the sweep. */
+    { static int s_pf2c = -1;
+      if (s_pf2c < 0) { const char* e = getenv("PAD_FILE2"); s_pf2c = (e && *e) ? 1 : 0; }
+      if (s_pf2c) s_host_state[1].connected = 1; }
     pad_track_assign();
     pad_unlock();
 }
@@ -1239,6 +1247,37 @@ skip_inject: ;
               if (data->len > 0) held_n--;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
+      } }
+
+    /* PAD_FILE2=<path> -- the PAD_FILE contract for port 1, so a second
+     * player can be driven headless (Battle's join screen needs a START
+     * and a Ready confirm on pad 2; every other scripted mechanism in
+     * this file is port-0 only). Same encoding and admission rules. */
+    { static int s_pf2 = -1; static char pf2_path[512];
+      static unsigned held2_mask = 0; static int held2_n = 0;
+      if (s_pf2 < 0) { const char* e = getenv("PAD_FILE2");
+                      s_pf2 = (e && *e) ? 1 : 0;
+                      if (s_pf2) { strncpy(pf2_path, e, sizeof pf2_path - 1); pf2_path[sizeof pf2_path - 1] = 0; } }
+      if (s_pf2 && port_no == 1) {
+          if (held2_n <= 0) {
+              FILE* f = fopen(pf2_path, "rb");
+              if (f) {
+                  char buf[64]; buf[0] = 0;
+                  if (fgets(buf, sizeof buf, f)) {
+                      char* rest;
+                      unsigned m = (unsigned)strtoul(buf, &rest, 0);
+                      int n = (int)strtol(rest, 0, 0);
+                      if (m) { held2_mask = m; held2_n = n > 0 ? n : 40;
+                               printf("[cellPad] PAD_FILE2 press 0x%04X\n", m); fflush(stdout); }
+                  }
+                  fclose(f);
+                  if (held2_n > 0) { FILE* w = fopen(pf2_path, "wb"); if (w) fclose(w); }
+              }
+          }
+          if (held2_n > 0) {
+              if (data->len > 0) held2_n--;
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held2_mask & 0xFF);
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held2_mask >> 8) & 0xFF); }
       } }
 
     /* Analog sticks */
