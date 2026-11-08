@@ -1130,7 +1130,24 @@ int rsx_draw_engine_blit(u32 src_loc, u32 src_off, u32 src_pitch,
         if (di == ENG_INVALID) {
             dx_surf = dx;
             dy_surf = dy;
-            di = eng_surface_get(dst_loc, dst_off, dx + dw, dy + dh,
+            /* BLIT-DST-SURFACE PATCH: size a fresh destination from the
+             * pitch, not from this one blit's rect. A guest may write a
+             * buffer as a grid of offset-addressed tiles (Comet Crash
+             * resolves its AA scene into a 1920x1080 texture as twelve
+             * 512x512 blits, each positioned by its dst offset); a surface
+             * created at one tile's rect and offset makes every other tile
+             * miss it and spawn a fragment, and the texture sampler --
+             * which resolves the buffer's base offset -- ends up sampling
+             * a single tile stretched over the frame. The pitch names the
+             * buffer's row width, and a buffer as wide as the frame is
+             * frame-sized, so it takes the frame's height as well.
+             * Narrower buffers keep the blit-rect size they have today. */
+            u32 want_w = dx + dw;
+            u32 want_h = dy + dh;
+            const u32 pitch_w = dst_pitch / 4u;
+            if (pitch_w > want_w) want_w = pitch_w;
+            if (want_w >= g.width && g.height > want_h) want_h = g.height;
+            di = eng_surface_get(dst_loc, dst_off, want_w, want_h,
                                  RSX_BE_FMT_R8G8B8A8, dst_pitch, 0);
             if (di != ENG_INVALID) g.surfaces[di].pitch = dst_pitch;
         }
