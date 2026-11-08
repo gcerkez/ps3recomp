@@ -47,6 +47,12 @@ typedef struct {
     mp3dec_t dec;
     int16_t  hold[1152 * 2];      /* one max-size stereo frame */
     int      hold_bytes;
+    int      fmt_hz;              /* CODEC FIX2: last decoded frame format */
+    int      fmt_ch;
+    uint8_t  tail[4096];          /* CODEC FIX2: recent consumed frames */
+    int      tail_len;
+    int      tail_fl[24];         /* whole-frame lengths queued in tail */
+    int      tail_nf;
 } codec_stream;
 
 static codec_stream s_streams[CODEC_MAX_STREAMS];
@@ -71,6 +77,10 @@ static codec_stream *stream_for(uint32_t key)
             s_streams[i].used = 1;
             s_streams[i].key = key;
             s_streams[i].hold_bytes = 0;
+            s_streams[i].fmt_hz = 0;
+            s_streams[i].fmt_ch = 0;
+            s_streams[i].tail_len = 0;
+            s_streams[i].tail_nf = 0;
             mp3dec_init(&s_streams[i].dec);
             return &s_streams[i];
         }
@@ -86,6 +96,51 @@ static int codec_log(void)
 
 /* Returns 1 when the call was handled (caller performs SPU_RET with
  * the r3 left in place), 0 to fall back to the zeroed-PIC stub. */
+/* CODEC FIX2: frame length + format from the 4-byte MP3 header at p,
+ * or 0 when the header is not a parseable Layer III header. The seam
+ * accepts a decode only when minimp3's reported byte count matches
+ * this - a decode that overruns into stale staged bytes reports a
+ * longer "frame" than the header allows and must not be consumed. */
+static int mp3_frame_len_at(const uint8_t *p, int avail, int *hz_out,
+                            int *ch_out, int *spf_out)
+{
+    static const int br1[16] = {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,-1};
+    static const int br2[16] = {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,-1};
+    static const int sr_tab[3][3] = {{44100,48000,32000},{22050,24000,16000},{11025,12000,8000}};
+    int ver, bri, br, sri, sr;
+    if (avail < 4) return 0;
+    if (p[0] != 0xFF || (p[1] & 0xE0) != 0xE0) return 0;
+    ver = (p[1] >> 3) & 3;              /* 3=MPEG1, 2=MPEG2, 0=MPEG2.5 */
+    if (ver == 1) return 0;
+    if (((p[1] >> 1) & 3) != 1) return 0;   /* Layer III only */
+    bri = (p[2] >> 4) & 15;
+    br = (ver == 3) ? br1[bri] : br2[bri];
+    sri = (p[2] >> 2) & 3;
+    if (br <= 0 || sri == 3) return 0;
+    sr = sr_tab[ver == 3 ? 0 : (ver == 2 ? 1 : 2)][sri];
+    if (hz_out) *hz_out = sr;
+    if (ch_out) *ch_out = ((p[3] >> 6) == 3) ? 1 : 2;
+    if (spf_out) *spf_out = (ver == 3) ? 1152 : 576;
+    return ((ver == 3) ? 144 : 72) * br * 1000 / sr + ((p[2] >> 1) & 1);
+}
+
+/* CODEC FIX2: remember a consumed frame so a later recovery can
+ * rebuild the bit reservoir by replaying whole frames in order. */
+static void codec_tail_push(codec_stream *st, const uint8_t *bytes, int len)
+{
+    if (len <= 0 || len > (int)sizeof(st->tail)) { st->tail_len = 0; st->tail_nf = 0; return; }
+    while ((st->tail_len + len > (int)sizeof(st->tail) || st->tail_nf >= 24) && st->tail_nf > 0) {
+        int drop = st->tail_fl[0];
+        memmove(st->tail, st->tail + drop, (size_t)(st->tail_len - drop));
+        memmove(st->tail_fl, st->tail_fl + 1, (size_t)(st->tail_nf - 1) * sizeof(int));
+        st->tail_len -= drop;
+        st->tail_nf--;
+    }
+    memcpy(st->tail + st->tail_len, bytes, (size_t)len);
+    st->tail_fl[st->tail_nf++] = len;
+    st->tail_len += len;
+}
+
 int ps3_spu_mp3_pic_invoke(spu_context *ctx, uint32_t entry)
 {
     static int disabled = -1;
@@ -109,9 +164,78 @@ int ps3_spu_mp3_pic_invoke(spu_context *ctx, uint32_t entry)
         if (avail > CODEC_IN_MAX) avail = CODEC_IN_MAX;
         mp3dec_frame_info_t info;
         memset(&info, 0, sizeof(info));
+        /* CODEC FIX2: know the staged frame's true length up front. */
+        int fh_hz = 0, fh_ch = 0, fh_spf = 0;
+        int flen = mp3_frame_len_at(&ctx->ls[cursor], (int)avail,
+                                    &fh_hz, &fh_ch, &fh_spf);
+        /* A format change at this seam is a new stream: do not carry
+         * the previous stream's bit reservoir into it. */
+        if (flen > 0 && st->fmt_hz && (fh_hz != st->fmt_hz || fh_ch != st->fmt_ch)) {
+            mp3dec_init(&st->dec);
+            st->tail_len = 0;
+            st->tail_nf = 0;
+        }
         int samples = mp3dec_decode_frame(&st->dec, &ctx->ls[cursor],
                                           (int)avail, st->hold, &info);
-        if (samples > 0 && info.frame_bytes > 0) {
+        int ok = (samples > 0 && info.frame_bytes > 0 &&
+                  (flen == 0 || info.frame_bytes == flen));
+        if (!ok && flen > 0 && flen <= (int)avail) {
+            /* Recovery: replay the kept tail frames through a fresh
+             * decoder to rebuild the bit reservoir exactly, then
+             * decode the staged frame. */
+            uint8_t scratch[4096 + 2048];
+            int slen = st->tail_len + flen;
+            if (slen <= (int)sizeof(scratch)) {
+                mp3dec_t fresh;
+                mp3dec_frame_info_t fi2;
+                int16_t tmp[1152 * 2];
+                int pos = 0, guard = 0;
+                memcpy(scratch, st->tail, (size_t)st->tail_len);
+                memcpy(scratch + st->tail_len, &ctx->ls[cursor], (size_t)flen);
+                mp3dec_init(&fresh);
+                while (pos < st->tail_len && guard++ < 32) {
+                    memset(&fi2, 0, sizeof(fi2));
+                    if (mp3dec_decode_frame(&fresh, scratch + pos,
+                                            slen - pos, tmp, &fi2) < 0 ||
+                        fi2.frame_bytes <= 0)
+                        break;
+                    pos += fi2.frame_bytes;
+                }
+                if (pos == st->tail_len) {
+                    memset(&fi2, 0, sizeof(fi2));
+                    int s2 = mp3dec_decode_frame(&fresh, scratch + pos,
+                                                 slen - pos, tmp, &fi2);
+                    if (s2 > 0 && fi2.frame_bytes == flen) {
+                        st->dec = fresh;
+                        memcpy(st->hold, tmp,
+                               (size_t)s2 * fi2.channels * sizeof(int16_t));
+                        samples = s2;
+                        info = fi2;
+                        ok = 1;
+                    }
+                }
+            }
+            if (!ok) {
+                /* Last resort: skip the frame. Consuming its header
+                 * length and emitting silence keeps the caller's
+                 * staging advancing - a stream must never wedge -
+                 * and the skipped frame joins the tail so the next
+                 * frame can heal through the recovery path. */
+                memset(st->hold, 0, sizeof(st->hold));
+                samples = fh_spf;
+                memset(&info, 0, sizeof(info));
+                info.frame_bytes = flen;
+                info.hz = fh_hz;
+                info.channels = fh_ch;
+                mp3dec_init(&st->dec);
+                ok = 1;
+            }
+        }
+        if (ok) {
+            if (flen > 0 && info.frame_bytes == flen)
+                codec_tail_push(st, &ctx->ls[cursor], flen);
+            st->fmt_hz = info.hz;
+            st->fmt_ch = info.channels;
             st->hold_bytes = samples * info.channels * (int)sizeof(int16_t);
             consumed = (uint32_t)info.frame_bytes;
             if (codec_log()) {
