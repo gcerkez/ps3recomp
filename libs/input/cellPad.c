@@ -958,6 +958,27 @@ static void pad_shutdown_backend(void)
  * including one sampling for button-press edges. */
 #define PAD_POLL_INTERVAL_MS 4
 
+/* PAD CADENCE PATCH: the 4 ms cadence is only unobservable for
+ * edge-sampling titles. A title whose input TIMING counts fresh
+ * reports (Comet Crash's menu auto-repeat does) runs that timing
+ * ~4x fast in any state whose loop polls faster than 60 Hz -- its
+ * pause loop polls ~280x/s, so pause menus repeated at ~5 reports
+ * where the front-end menus repeat at ~14. Hardware serves one
+ * fresh report per vblank, so the effective default is now 16 ms.
+ * The PAD_POLL_INTERVAL_MS env var overrides (4 = old behaviour). */
+#define PAD_POLL_INTERVAL_MS_DEFAULT 16
+
+static unsigned long long pad_poll_interval_ms(void)
+{
+    static long s_iv = -1;
+    if (s_iv < 0) {
+        const char* e = getenv("PAD_POLL_INTERVAL_MS");
+        s_iv = e ? strtol(e, 0, 0) : PAD_POLL_INTERVAL_MS_DEFAULT;
+        if (s_iv < 1) s_iv = 1;
+    }
+    return (unsigned long long)s_iv;
+}
+
 static unsigned long long pad_now_ms(void)
 {
 #ifdef _WIN32
@@ -974,7 +995,7 @@ static void pad_poll_backend(void)
 {
     static unsigned long long s_last_ms = 0;
     unsigned long long now = pad_now_ms();
-    if (s_last_ms && now - s_last_ms < PAD_POLL_INTERVAL_MS) return;
+    if (s_last_ms && now - s_last_ms < pad_poll_interval_ms()) return;
     if (!pad_lock_try()) return;   /* another thread is polling: its result serves this read */
     s_last_ms = now;
     /* A real pad streams reports at roughly this rate whether or not anything
@@ -1423,7 +1444,7 @@ emit:
      * Freshness was finalized before input injection above. Hand out one
      * packet per host report and report len = 0 for any read
      * after that until the next one arrives (pad_poll_backend sets the flag when
-     * it actually re-polls, every PAD_POLL_INTERVAL_MS). That is what the
+     * it actually re-polls, every pad_poll_interval_ms()). That is what the
      * hardware does: a pad streams reports at a fixed rate whether or not
      * anything changed, and libpad buffers them.
      *
