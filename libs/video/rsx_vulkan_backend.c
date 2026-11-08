@@ -2594,7 +2594,29 @@ static void vk_eng_color_target_blit(void* user, u32 src_surface, u32 sx, u32 sy
     vk_eng_obj* s = vk_eng_get(src_surface, VK_ENG_COLOR);
     vk_eng_obj* d = vk_eng_get(dst_surface, VK_ENG_COLOR);
     if (!s || !d || s == d || !sw || !sh || !dw || !dh) return;
-    if (sx + sw > s->w || sy + sh > s->h || dx + dw > d->w || dy + dh > d->h) return;
+    /* BLIT-CLAMP PATCH: clip an edge overshoot instead of dropping
+     * the whole blit. A guest may address a tiled transfer with
+     * (1,1)-based source origins, which puts the far column/row one
+     * sample past the source surface's end (Comet Crash's AA
+     * resolve: 3073+768 = 3841 > 3840); the RSX clips the read at
+     * the surface edge, and so does the CPU fallback. Shrink only
+     * the overflowing source extent — the destination keeps its
+     * size, so the edge texel stretches by less than one sample.
+     * A destination overflow shrinks both extents proportionally
+     * to preserve the guest's scale. A blit that starts outside
+     * either surface is still dropped. */
+    if (sx >= s->w || sy >= s->h || dx >= d->w || dy >= d->h) return;
+    if (sx + sw > s->w) sw = s->w - sx;
+    if (sy + sh > s->h) sh = s->h - sy;
+    if (dx + dw > d->w) {
+        const u32 nw = d->w - dx;
+        sw = (u32)((u64)sw * nw / dw); dw = nw;
+    }
+    if (dy + dh > d->h) {
+        const u32 nh = d->h - dy;
+        sh = (u32)((u64)sh * nh / dh); dh = nh;
+    }
+    if (!sw || !sh || !dw || !dh) return;
     const int batched = vk_eb_active();
     if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) return;
     vk_barrier_image(s->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
