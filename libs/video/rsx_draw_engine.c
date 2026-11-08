@@ -2272,6 +2272,54 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
     s_dbz.mn = mn; s_dbz.mx = mx;
 }
 
+/* FP MEMO PATCH: see patch header -- memoize eng_pipeline_get's
+ * per-draw fragment-program walks on a content fingerprint. */
+#define ENG_FP_MEMO_ENTRIES 16u
+#define ENG_FP_MEMO_MAX_CONSTANTS 256u
+typedef struct eng_fp_memo {
+    u64 fingerprint;
+    u32 fp_size;
+    u32 sampled_units;
+    u64 fp_struct;
+    int collect_failed;
+    int constants_ok;
+    u32 constants_count;
+    u32 constants[ENG_FP_MEMO_MAX_CONSTANTS][4];
+    u8  gamma_in[16];
+    u32 gamma_units;
+    int gamma_valid;
+    u8  expand_in[16];
+    u32 expand_units;
+    int expand_valid;
+} eng_fp_memo;
+static eng_fp_memo s_fp_memo[ENG_FP_MEMO_ENTRIES];
+
+static eng_fp_memo* eng_fp_memo_get(const u8* fp_uc, u32 fp_size)
+{
+    const u64 fp = eng_fnv1a(fp_uc, fp_size, 1469598103934665603ull);
+    eng_fp_memo* e = &s_fp_memo[(fp ^ (fp >> 32)) & (ENG_FP_MEMO_ENTRIES - 1u)];
+    if (e->fingerprint == fp && e->fp_size == fp_size) return e;
+    memset(e, 0, sizeof *e);
+    e->fingerprint = fp;
+    e->fp_size = fp_size;
+    e->sampled_units = rsx_fp_texture_units(fp_uc, fp_size);
+    e->fp_struct = rsx_fp_structural_hash(fp_uc, fp_size,
+                                           1469598103934665603ull);
+    /* FIFO-thread only, like g.fp_constants itself. */
+    static rsx_fp_constant_block s_collect_scratch;
+    const int rc = rsx_fp_collect_constants(fp_uc, fp_size,
+                                            &s_collect_scratch);
+    e->collect_failed = (rc < 0);
+    e->constants_ok = (rc >= 0 &&
+                       s_collect_scratch.count <= ENG_FP_MEMO_MAX_CONSTANTS);
+    if (e->constants_ok) {
+        e->constants_count = s_collect_scratch.count;
+        memcpy(e->constants, s_collect_scratch.values,
+               s_collect_scratch.count * 16u);
+    }
+    return e;
+}
+
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
@@ -2285,6 +2333,24 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     u32 vp_instrs = 0, fp_size = 0;
     /* No resident program pair means the built-in one; see kEngFixedVS. */
     const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
+    /* FP MEMO PATCH: fill every by-program result from the memo.
+     * Both failure returns mirror the original points exactly: a
+     * zero structural hash and a failed constants collect both made
+     * this function return 0 before any pipeline work. */
+    eng_fp_memo* memo = NULL;
+    g.fp_constants.count = 0;
+    if (!fixed) {
+        memo = eng_fp_memo_get(fp_uc, fp_size);
+        if (!memo->fp_struct || memo->collect_failed) return 0;
+        if (memo->constants_ok) {
+            g.fp_constants.count = memo->constants_count;
+            memcpy(g.fp_constants.values, memo->constants,
+                   memo->constants_count * 16u);
+        } else if (rsx_fp_collect_constants(fp_uc, fp_size,
+                                            &g.fp_constants) < 0) {
+            return 0;
+        }
+    }
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
@@ -2302,7 +2368,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
     rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
     u32 shadow_mask = 0;
-    const u32 sampled_units = fixed ? 0 : rsx_fp_texture_units(fp_uc, fp_size);
+    const u32 sampled_units = fixed ? 0 : memo->sampled_units;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         if (!(sampled_units & (1u << u))) continue;
         rsx_dsp_texture t;
@@ -2316,7 +2382,19 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
         if (t.enabled) gamma_masks[u] = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
     }
-    const u32 gamma_units = fixed ? 0 : rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
+    u32 gamma_units = 0;
+    if (!fixed) {
+        if (memo->gamma_valid &&
+            !memcmp(memo->gamma_in, gamma_masks, sizeof gamma_masks)) {
+            gamma_units = memo->gamma_units;
+        } else {
+            gamma_units = rsx_fp_texture_gamma_units(fp_uc, fp_size,
+                                                     gamma_masks);
+            memcpy(memo->gamma_in, gamma_masks, sizeof gamma_masks);
+            memo->gamma_units = gamma_units;
+            memo->gamma_valid = 1;
+        }
+    }
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
         if (!(gamma_units & (1u << u))) gamma_masks[u] = 0;
     /* Texture sign expansion: SET_TEXTURE_ADDRESS's UNSIGNED_REMAP_BIASED
@@ -2327,7 +2405,19 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
         if (t.enabled) expand_masks[u] = rsx_texture_expand_mask(t.format, t.remap, t.filter, t.wrap);
     }
-    const u32 expand_units = fixed ? 0 : rsx_fp_texture_expand_units(fp_uc, fp_size, expand_masks);
+    u32 expand_units = 0;
+    if (!fixed) {
+        if (memo->expand_valid &&
+            !memcmp(memo->expand_in, expand_masks, sizeof expand_masks)) {
+            expand_units = memo->expand_units;
+        } else {
+            expand_units = rsx_fp_texture_expand_units(fp_uc, fp_size,
+                                                       expand_masks);
+            memcpy(memo->expand_in, expand_masks, sizeof expand_masks);
+            memo->expand_units = expand_units;
+            memo->expand_valid = 1;
+        }
+    }
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
         if (!(expand_units & (1u << u))) expand_masks[u] = 0;
 
@@ -2340,9 +2430,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (!(unnorm_mask & (1u << u)))
             unnorm_dim[u][0] = unnorm_dim[u][1] = unnorm_dim[u][2] = 0;
 
-    g.fp_constants.count = 0;
-    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
-        return 0;
+    /* g.fp_constants was filled at the FP MEMO consult above. */
 
     /* An antialiased target is held at its sample grid; WPOS must still count
      * pixels (rsx_fp_apply_wpos_grid). */
@@ -2363,8 +2451,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     } else {
         key = eng_vp_hash(vp_uc, vp_instrs * 16u, key);
         if (vp_branch_bits_used) key = eng_fnv1a(&vp_branch_bits, sizeof vp_branch_bits, key);
-        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
-        if (!key) return 0;
+        /* FP MEMO PATCH: the basis-seeded structural hash (the
+         * program's canonical identity, cf. eng_fp_debug_hash) is
+         * mixed in as bytes; the zero case returned earlier. */
+        key = eng_fnv1a(&memo->fp_struct, sizeof memo->fp_struct, key);
         const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         if (srgb_output) key = eng_fnv1a(&srgb_output, sizeof srgb_output, key);
