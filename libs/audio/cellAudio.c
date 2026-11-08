@@ -555,10 +555,32 @@ static void audio_mix_one_block(void)
 
     mutex_unlock(&s_audio_mutex);
 
-    /* Clip to [-1.0, 1.0] */
-    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
-        if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
-        if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
+    /* Clip to [-1.0, 1.0]. MIX NORM PATCH: with AUDIO_MIX_NORM set,
+     * a block that would clip is scaled uniformly to peak 1.0
+     * instead -- stacked sounds keep their waveform and relative
+     * balance rather than being squared off at the rail. Blocks at
+     * or under full scale are bit-identical either way. */
+    static int s_mix_norm = -1;
+    if (s_mix_norm < 0) {
+        const char* e = getenv("AUDIO_MIX_NORM");
+        s_mix_norm = (e && atoi(e)) ? 1 : 0;
+    }
+    if (s_mix_norm) {
+        float peak = 0.0f;
+        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+            float a = s_mix_buffer[i] < 0.0f ? -s_mix_buffer[i] : s_mix_buffer[i];
+            if (a > peak) peak = a;
+        }
+        if (peak > 1.0f) {
+            float g = 1.0f / peak;
+            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++)
+                s_mix_buffer[i] *= g;
+        }
+    } else {
+        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+            if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
+            if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
+        }
     }
 }
 
