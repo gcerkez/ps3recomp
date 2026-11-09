@@ -4226,6 +4226,15 @@ void rsx_vulkan_backend_shutdown(void)
  * quit-immediately behaviour. */
 extern int ps3_host_quit_needs_confirm(void) __attribute__((weak));
 
+/* SAVESTATE PATCH: a title may offer save-state capture/restore on
+ * F5/F9. The hooks are weak symbols, like the quit confirmation
+ * above: titles that do not define them keep the keys inert. The
+ * title calls ps3_rsx_flush_guest_caches() (defined below) after it
+ * rewrites guest memory, so no cache built from the old bytes is
+ * sampled again. */
+extern void ps3_host_savestate_save(void) __attribute__((weak));
+extern void ps3_host_savestate_load(void) __attribute__((weak));
+
 static int vk_quit_confirmed(void)
 {
     if (!ps3_host_quit_needs_confirm || !ps3_host_quit_needs_confirm())
@@ -4244,6 +4253,24 @@ static int vk_quit_confirmed(void)
     return button == 1;
 }
 
+/* SAVESTATE PATCH: drop everything this backend derived from guest
+ * memory: submit and idle first (nothing may still be reading the
+ * objects being destroyed), drop the cached framebuffers, evict the
+ * draw engine's textures/surfaces/depth targets, and unbind the
+ * fallback path's decoded texture units. The next frame re-creates
+ * and re-seeds all of it from current guest memory. Declared weak by
+ * the title glue; titles on other backends simply skip the call. */
+void ps3_rsx_flush_guest_caches(void)
+{
+    if (!s_vk.device) return;
+    vk_eng_flush();
+    vk_device_idle();
+    vk_eng_drop_framebuffers();
+    rsx_draw_engine_invalidate_guest_caches();
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) vk_tex_off(u);
+    fprintf(stderr, "[rsx] guest caches flushed (savestate)\n");
+}
+
 int rsx_vulkan_backend_pump_messages(void)
 {
     if (!s_vk.windowed) return 0;
@@ -4260,6 +4287,12 @@ int rsx_vulkan_backend_pump_messages(void)
             if (SDL_SetWindowFullscreen(s_vk.window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP) == 0)
                 SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
             s_vk_resized = 1;
+        } else if (e.type == SDL_KEYDOWN && !e.key.repeat && e.key.keysym.sym == SDLK_F5) {
+            /* SAVESTATE PATCH: F5 saves, F9 loads, when the title
+             * provides the weak hooks. */
+            if (ps3_host_savestate_save) ps3_host_savestate_save();
+        } else if (e.type == SDL_KEYDOWN && !e.key.repeat && e.key.keysym.sym == SDLK_F9) {
+            if (ps3_host_savestate_load) ps3_host_savestate_load();
         } else if (e.type == SDL_WINDOWEVENT &&
                    (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESTORED ||
                     e.window.event == SDL_WINDOWEVENT_MAXIMIZED)) {
