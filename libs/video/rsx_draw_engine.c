@@ -4026,6 +4026,44 @@ void rsx_draw_engine_flush(void)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
 }
 
+/* SAVESTATE PATCH: drop every cache entry whose content came from guest
+ * memory -- cached textures, colour surfaces and depth targets --
+ * releasing each backend object through the same callbacks eviction
+ * uses. A host that rewrites guest memory wholesale (a save-state
+ * restore) calls this so the next frame re-creates and re-seeds
+ * everything from the new bytes instead of sampling what the old bytes
+ * decoded to. Pipelines and program memos are content-keyed and keep
+ * themselves honest, so they stay. */
+void rsx_draw_engine_invalidate_guest_caches(void)
+{
+    if (!g.be) return;
+    for (u32 i = 0; i < g.n_textures; i++) {
+        eng_texture* e = &g.textures[i];
+        if (e->handle) g.be->texture_release(g.be->user, e->handle);
+        e->handle = 0;
+    }
+    g.n_textures = 0;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        eng_surface* s = &g.surfaces[i];
+        if (s->feedback) g.be->texture_release(g.be->user, s->feedback);
+        if (s->handle) g.be->color_target_release(g.be->user, s->handle);
+        s->feedback = 0;
+        s->handle = 0;
+    }
+    g.n_surfaces = 0;
+    g.last_present_surface = 0;
+    for (u32 i = 0; i < g.n_zdepths; i++) {
+        eng_zdepth* z = &g.zdepths[i];
+        if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
+        if (z->conv) g.be->texture_release(g.be->user, z->conv);
+        if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
+        if (z->dbz_copy && g.be->texture_release)
+            g.be->texture_release(g.be->user, z->dbz_copy);
+        z->handle = z->conv = z->snapshot = z->dbz_copy = 0;
+    }
+    g.n_zdepths = 0;
+}
+
 void rsx_draw_engine_present(void)
 {
     /* A host that drives the flip itself gets whichever buffer the guest's

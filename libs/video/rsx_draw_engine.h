@@ -344,6 +344,11 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 /* The guest's SET_REFERENCE sync point: submit and wait, so a title spinning
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
+/* SAVESTATE PATCH: evict every cache entry whose content came from
+ * guest memory (textures, colour surfaces, depth targets), releasing
+ * the backend objects. For hosts that rewrite guest memory wholesale
+ * (save-state restore). */
+void rsx_draw_engine_invalidate_guest_caches(void);
 
 /* Present whatever the frame has recorded, for a host that drives the flip
  * itself rather than through the FIFO's 0xE944. */
