@@ -99,6 +99,24 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
+/* SAVESTATE RESYNC: PAD_FILE/PAD_FILE2 injected-hold state lives
+ * at file scope so ps3_pad_resync_savestate() can clear it. */
+static unsigned s_pf_s_pf_held_mask = 0; static int s_pf_s_pf_held_n = 0;
+static unsigned s_pf2_s_pf_held_mask = 0; static int s_pf2_s_pf_held_n = 0;
+
+/* SAVESTATE RESYNC: called by the title glue after a savestate
+ * restore. Drops any in-flight injected holds and marks every
+ * port fresh, so the next cellPadGetData calls admit new
+ * presses exactly as after a poll sweep. */
+void ps3_pad_resync_savestate(void)
+{
+    s_pf_s_pf_held_mask = 0; s_pf_s_pf_held_n = 0;
+    s_pf2_s_pf_held_mask = 0; s_pf2_s_pf_held_n = 0;
+    for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++)
+        s_data_fresh[_i] = 1;
+    printf("[cellPad] savestate resync: holds cleared, ports fresh\n");
+    fflush(stdout);
+}
 
 #if PAD_BACKEND_SDL2
 /* PS3 port i's controller, by SDL instance id (-1 = none); the port keeps the
@@ -1272,12 +1290,12 @@ skip_inject: ;
      *                            # long hold; the default is 40)
      */
     { static int s_pf = -1; static char pf_path[512];
-      static unsigned held_mask = 0; static int held_n = 0;
+      /* hold state at file scope: s_pf_held_* -- SAVESTATE RESYNC */
       if (s_pf < 0) { const char* e = getenv("PAD_FILE");
                       s_pf = (e && *e) ? 1 : 0;
                       if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
       if (s_pf && port_no == 0) {
-          if (held_n <= 0) {
+          if (s_pf_held_n <= 0) {
               FILE* f = fopen(pf_path, "rb");
               if (f) {
                   char buf[64]; buf[0] = 0;
@@ -1285,17 +1303,17 @@ skip_inject: ;
                       char* rest;
                       unsigned m = (unsigned)strtoul(buf, &rest, 0);
                       int n = (int)strtol(rest, 0, 0);
-                      if (m) { held_mask = m; held_n = n > 0 ? n : 40;
+                      if (m) { s_pf_held_mask = m; s_pf_held_n = n > 0 ? n : 40;
                                printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
                   }
                   fclose(f);
-                  if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
+                  if (s_pf_held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
               }
           }
-          if (held_n > 0) {
-              if (data->len > 0) held_n--;
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
+          if (s_pf_held_n > 0) {
+              if (data->len > 0) s_pf_held_n--;
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(s_pf_held_mask & 0xFF);
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((s_pf_held_mask >> 8) & 0xFF); }
       } }
 
     /* PAD_FILE2=<path> -- the PAD_FILE contract for port 1, so a second
@@ -1303,12 +1321,12 @@ skip_inject: ;
      * and a Ready confirm on pad 2; every other scripted mechanism in
      * this file is port-0 only). Same encoding and admission rules. */
     { static int s_pf2 = -1; static char pf2_path[512];
-      static unsigned held2_mask = 0; static int held2_n = 0;
+      /* hold state at file scope: s_pf2_held_* -- SAVESTATE RESYNC */
       if (s_pf2 < 0) { const char* e = getenv("PAD_FILE2");
                       s_pf2 = (e && *e) ? 1 : 0;
                       if (s_pf2) { strncpy(pf2_path, e, sizeof pf2_path - 1); pf2_path[sizeof pf2_path - 1] = 0; } }
       if (s_pf2 && port_no == 1) {
-          if (held2_n <= 0) {
+          if (s_pf2_s_pf_held_n <= 0) {
               FILE* f = fopen(pf2_path, "rb");
               if (f) {
                   char buf[64]; buf[0] = 0;
@@ -1316,17 +1334,17 @@ skip_inject: ;
                       char* rest;
                       unsigned m = (unsigned)strtoul(buf, &rest, 0);
                       int n = (int)strtol(rest, 0, 0);
-                      if (m) { held2_mask = m; held2_n = n > 0 ? n : 40;
+                      if (m) { s_pf2_s_pf_held_mask = m; s_pf2_s_pf_held_n = n > 0 ? n : 40;
                                printf("[cellPad] PAD_FILE2 press 0x%04X\n", m); fflush(stdout); }
                   }
                   fclose(f);
-                  if (held2_n > 0) { FILE* w = fopen(pf2_path, "wb"); if (w) fclose(w); }
+                  if (s_pf2_s_pf_held_n > 0) { FILE* w = fopen(pf2_path, "wb"); if (w) fclose(w); }
               }
           }
-          if (held2_n > 0) {
-              if (data->len > 0) held2_n--;
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held2_mask & 0xFF);
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held2_mask >> 8) & 0xFF); }
+          if (s_pf2_s_pf_held_n > 0) {
+              if (data->len > 0) s_pf2_s_pf_held_n--;
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(s_pf2_s_pf_held_mask & 0xFF);
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((s_pf2_s_pf_held_mask >> 8) & 0xFF); }
       } }
 
     /* Analog sticks */
