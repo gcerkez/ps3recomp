@@ -555,6 +555,29 @@ static void audio_mix_one_block(void)
 
     mutex_unlock(&s_audio_mutex);
 
+    /* MIX HEADROOM PATCH: fixed master headroom, modelled on
+     * iopenmohaa-ps3's PS3A_MIX_HEADROOM ("reserve 6 dB for overlapping
+     * game sounds", code/client/snd_ps3audio_new.cpp). Our mixer sums
+     * every active port at full level and only meets the rail at the
+     * final clip below, so routine overlaps are squared off even when
+     * nothing is individually loud. Scaling the finished mix by
+     * AUDIO_HEADROOM (default 0.5 = -6 dB) ahead of the
+     * normalise/clip stage keeps ordinary stacking under the rail;
+     * the clip remains as a safety for true peaks, and the opt-in
+     * AUDIO_MIX_NORM stage still runs after this one when enabled.
+     * AUDIO_HEADROOM=1 restores the old full-level mix exactly. */
+    static float s_headroom = -1.0f;
+    if (s_headroom < 0.0f) {
+        const char* e = getenv("AUDIO_HEADROOM");
+        float g = e ? (float)atof(e) : 0.5f;
+        if (!(g > 0.0f) || g > 4.0f) g = 0.5f;
+        s_headroom = g;
+    }
+    if (s_headroom != 1.0f) {
+        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++)
+            s_mix_buffer[i] *= s_headroom;
+    }
+
     /* Clip to [-1.0, 1.0]. MIX NORM PATCH: with AUDIO_MIX_NORM set,
      * a block that would clip is scaled uniformly to peak 1.0
      * instead -- stacked sounds keep their waveform and relative
