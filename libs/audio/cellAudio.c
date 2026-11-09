@@ -183,7 +183,21 @@ static int audio_backend_init(void)
     want.freq     = CELL_AUDIO_SAMPLE_RATE;
     want.format   = AUDIO_F32SYS;
     want.channels = 2;
-    want.samples  = CELL_AUDIO_BLOCK_SAMPLES;
+    /* The device's buffer size. SDL hands it to PulseAudio as the stream's
+     * whole target latency (tlength) and to PipeWire as the node's latency,
+     * so one block (256 frames, 5.3 ms) leaves the server only 5.3 ms to
+     * cover any late write: crackle on a busy desktop. Soulbrandt measured
+     * their stream running short 12-14% of the time at 256 frames on a
+     * PipeWire desktop and never at 1024 (bc5540f8). Ask for 1024 frames
+     * (21.3 ms); AUDIO_SDL_FRAMES=<n> overrides, clamped to 256..4096.
+     * Only the device request changes: the mix thread's pacing
+     * (absolute-deadline, drop/resync) stays in charge of timing. */
+    { static int s_frames = -1;
+      if (s_frames < 0) { const char* e = getenv("AUDIO_SDL_FRAMES");
+                          s_frames = e ? atoi(e) : 1024;
+                          if (s_frames < 256) s_frames = 256;
+                          if (s_frames > 4096) s_frames = 4096; }
+      want.samples = (Uint16)s_frames; }
     want.callback = NULL; /* We'll use SDL_QueueAudio */
 
     s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
