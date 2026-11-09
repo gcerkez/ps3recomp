@@ -141,6 +141,18 @@ static void codec_tail_push(codec_stream *st, const uint8_t *bytes, int len)
     st->tail_len += len;
 }
 
+/* SAVESTATE RESET: called by the title glue after a savestate
+ * restore. The stream table is keyed by guest workspace pointer
+ * and a same-format restart is never detected (notes 040); the
+ * restored workspaces belong to the saved timeline, so drop
+ * every stream -- stream_for() re-initialises slots on use. */
+void ps3_spu_mp3_reset_streams(void)
+{
+    memset(s_streams, 0, sizeof s_streams);
+    if (codec_log())
+        fprintf(stderr, "[codec] savestate: stream table reset\n");
+}
+
 int ps3_spu_mp3_pic_invoke(spu_context *ctx, uint32_t entry)
 {
     static int disabled = -1;
