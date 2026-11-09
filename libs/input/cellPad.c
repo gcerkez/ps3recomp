@@ -101,7 +101,7 @@ static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
 /* SAVESTATE RESYNC: PAD_FILE/PAD_FILE2 injected-hold state lives
  * at file scope so ps3_pad_resync_savestate() can clear it. */
-static unsigned s_pf_s_pf_held_mask = 0; static int s_pf_s_pf_held_n = 0;
+static unsigned s_pf_held_mask = 0; static int s_pf_held_n = 0;
 static unsigned s_pf2_s_pf_held_mask = 0; static int s_pf2_s_pf_held_n = 0;
 
 /* SAVESTATE RESYNC: called by the title glue after a savestate
@@ -110,7 +110,7 @@ static unsigned s_pf2_s_pf_held_mask = 0; static int s_pf2_s_pf_held_n = 0;
  * presses exactly as after a poll sweep. */
 void ps3_pad_resync_savestate(void)
 {
-    s_pf_s_pf_held_mask = 0; s_pf_s_pf_held_n = 0;
+    s_pf_held_mask = 0; s_pf_held_n = 0;
     s_pf2_s_pf_held_mask = 0; s_pf2_s_pf_held_n = 0;
     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++)
         s_data_fresh[_i] = 1;
