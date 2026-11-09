@@ -24,6 +24,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <xmmintrin.h>   /* _mm_getcsr / _mm_setcsr: DAZ+FTZ around lifted SPU runs (below) */
+#endif
 /* setjmp/longjmp also save and restore the signal mask on POSIX: one
  * sigprocmask system call per halt, stack reset or task resume. These frames
  * never cross a signal handler, so the mask is the same at both ends. */
@@ -237,13 +240,30 @@ void spu_stop(spu_context* ctx)
     if (s_halt) spu_halt(ctx);
 }
 
-/* SPU_FLOAT_RZ=1: SPU code runs with FPCR at round toward zero with flush-to-zero, so the
- * single-precision helpers take their native form (spu_helpers.h, spu__nv_rz). The mode is set
- * on entry to spu_run_with_halt and the caller's FPCR is put back on the way out: a run can
- * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
- * lifted floating point must keep round to nearest with denormals. Double precision restores
- * the default around itself inside a run. arm64 only; elsewhere the exact forms always run.
- * Returns the FPCR to restore, or ~0 when nothing was changed. */
+/* Float mode for a lifted SPU run. The SPU's single precision has no
+ * denormals and (for its native forms) no round-to-nearest, so the host
+ * defaults do not match it.
+ *
+ * arm64 (SPU_FLOAT_RZ=1): FPCR is set to round toward zero with flush-to-zero,
+ * so the single-precision helpers take their native form (spu_helpers.h,
+ * spu__nv_rz).
+ *
+ * x86-64: MXCSR gets DAZ+FTZ for the run (SPU_FTZ=0 opts out; Soulbrandt's
+ * c0b1e46b, whose title hit the same profile). The SPU reads a denormal input
+ * as zero and flushes a too-small result to zero, so lifted results are the
+ * same either way -- the flags change only the host's cost: without them x86
+ * takes a microcode assist on denormal operands, and denormal-heavy guest
+ * code (decaying audio filters, e.g. a MultiStream synth) slowed enough that
+ * the mixer fell behind. RPCS3 does the same for its SPU threads. Rounding
+ * is untouched (the exact helpers keep their round-to-nearest inputs), and
+ * SPU_SCALAR_HELPERS builds are excluded: their software-exact forms are
+ * left to their own devices.
+ *
+ * The mode is set on entry to spu_run_with_halt and the caller's mode is put
+ * back on the way out: a run can happen synchronously on a PPU thread (a
+ * workload dispatched from the PPU caller), whose lifted floating point must
+ * keep its own mode. Double precision restores the default around itself
+ * inside a run. Returns the mode to restore, or ~0 when nothing was changed. */
 static uint64_t spu_float_mode_enter(void)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
@@ -260,6 +280,18 @@ static uint64_t spu_float_mode_enter(void)
     if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
     __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
     return v;
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(SPU_SCALAR_HELPERS)
+    static int s_ftz = -1;
+    int ftz = __atomic_load_n(&s_ftz, __ATOMIC_RELAXED);
+    if (ftz < 0) {
+        const char* e = getenv("SPU_FTZ");
+        ftz = !(e && e[0] == '0' && !e[1]);
+        __atomic_store_n(&s_ftz, ftz, __ATOMIC_RELAXED);
+    }
+    if (!ftz) return ~0ull;
+    const unsigned csr = _mm_getcsr();
+    _mm_setcsr(csr | 0x8040u);   /* FTZ (bit 15) | DAZ (bit 6) */
+    return (uint64_t)csr;        /* saved MXCSR is 16 bits of state: never ~0 */
 #else
     return ~0ull;
 #endif
@@ -268,6 +300,8 @@ static void spu_float_mode_leave(uint64_t outer)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     if (outer != ~0ull) __asm__ volatile("msr fpcr, %0" :: "r"(outer));
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(SPU_SCALAR_HELPERS)
+    if (outer != ~0ull) _mm_setcsr((unsigned)outer);
 #else
     (void)outer;
 #endif
