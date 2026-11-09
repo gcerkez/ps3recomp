@@ -53,6 +53,29 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdatomic.h>
+
+/* POOL SPIN EXPERIMENT: spin-then-park waits. Workers that find no
+ * work spin briefly watching the submission sequence before parking
+ * on the cond; the submitting caller spins briefly on its own job's
+ * atomic completion counters before waiting on the finished cond.
+ * The mutex/cond protocol is unchanged and remains the authority:
+ * every spin observation is only a hint, re-verified under the mutex
+ * before any state is touched (and the job fields a worker could
+ * race with are never dereferenced outside the mutex -- workers spin
+ * on the global sequence counter only). */
+#ifndef J_SPIN_WORKER
+#define J_SPIN_WORKER 256
+#endif
+#ifndef J_SPIN_CALLER
+#define J_SPIN_CALLER 1000
+#endif
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define J_PAUSE() _mm_pause()
+#else
+#define J_PAUSE() ((void)0)
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Small reentrant thread pool: callers submit one range job at a     */
@@ -72,13 +95,18 @@ typedef struct jjob {
     uint32_t       next;       /* next chunk index to hand out */
     uint32_t       done;       /* chunks finished */
     uint32_t       active;     /* threads currently draining this job */
+    _Atomic uint32_t a_done;   /* mirrors of done/active, written under */
+    _Atomic uint32_t a_active; /* the mutex, read lock-free ONLY by the */
+                               /* job's owner for its spin wait        */
     struct jjob   *qnext;
     pthread_cond_t finished;   /* broadcast when done==n_chunks && active==0 */
 } jjob_t;
 
 static pthread_mutex_t j_pool_mtx  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  j_pool_work = PTHREAD_COND_INITIALIZER;
-static jjob_t         *j_pool_head = 0, *j_pool_tail = 0;
+static _Atomic(jjob_t *) j_pool_head = 0;
+static jjob_t         *j_pool_tail = 0;
+static _Atomic uint32_t j_pool_seq = 0;  /* bumped on every enqueue */
 static int             j_pool_nworkers = 0;
 static int             j_pool_ready = 0;
 
@@ -100,6 +128,7 @@ static void j_drain(jjob_t *j)
 
         pthread_mutex_lock(&j_pool_mtx);
         j->done++;
+        atomic_store_explicit(&j->a_done, j->done, memory_order_release);
         pthread_mutex_unlock(&j_pool_mtx);
     }
 }
@@ -107,27 +136,54 @@ static void j_drain(jjob_t *j)
 static void *j_worker(void *unused)
 {
     (void)unused;
-    pthread_mutex_lock(&j_pool_mtx);
     for (;;) {
-        jjob_t *j = j_pool_head;
-        if (!j || j->done == j->n_chunks) {
-            /* Nothing to help with: no job queued, or the head job is
-             * complete and its owner is about to unlink it (the owner
-             * broadcasts j_pool_work when it does). A worker must never
-             * re-take a completed job: its chunks are gone, so draining
-             * it is a no-op that would spin against the owner's wait
-             * and starve the pool mutex (found by the harness, which
+        pthread_mutex_lock(&j_pool_mtx);
+        jjob_t *j = atomic_load_explicit(&j_pool_head, memory_order_relaxed);
+        if (j && j->done != j->n_chunks) {
+            /* Help with the head job. A worker must never re-take a
+             * completed job: its chunks are gone, so draining it is a
+             * no-op that would spin against the owner's wait and
+             * starve the pool mutex (found by the harness, which
              * livelocked at full CPU). */
-            pthread_cond_wait(&j_pool_work, &j_pool_mtx);
+            j->active++;
+            atomic_store_explicit(&j->a_active, j->active,
+                                  memory_order_release);
+            pthread_mutex_unlock(&j_pool_mtx);
+            j_drain(j);
+            pthread_mutex_lock(&j_pool_mtx);
+            j->active--;
+            atomic_store_explicit(&j->a_active, j->active,
+                                  memory_order_release);
+            if (j->done == j->n_chunks && j->active == 0)
+                pthread_cond_broadcast(&j->finished);
+            pthread_mutex_unlock(&j_pool_mtx);
             continue;
         }
-        j->active++;
+        /* Nothing to help with: no job queued, or the head job is
+         * complete and its owner is about to unlink it (the owner
+         * broadcasts j_pool_work when it does). Spin briefly watching
+         * the submission sequence -- in this workload the next group's
+         * job is typically submitted within microseconds, and a cond
+         * wake costs far more than the spin -- then park. */
+        uint32_t seq = atomic_load_explicit(&j_pool_seq,
+                                            memory_order_acquire);
         pthread_mutex_unlock(&j_pool_mtx);
-        j_drain(j);
+        int bumped = 0;
+        for (int s = 0; s < J_SPIN_WORKER; s++) {
+            if (atomic_load_explicit(&j_pool_seq, memory_order_acquire)
+                    != seq) {
+                bumped = 1;
+                break;
+            }
+            J_PAUSE();
+        }
+        if (bumped)
+            continue;
         pthread_mutex_lock(&j_pool_mtx);
-        j->active--;
-        if (j->done == j->n_chunks && j->active == 0)
-            pthread_cond_broadcast(&j->finished);
+        j = atomic_load_explicit(&j_pool_head, memory_order_relaxed);
+        if (!j || j->done == j->n_chunks)
+            pthread_cond_wait(&j_pool_work, &j_pool_mtx);
+        pthread_mutex_unlock(&j_pool_mtx);
     }
     return 0;
 }
@@ -152,17 +208,18 @@ static void j_pool_init(void)
 /* Run fn(arg, begin, end) over [0, n) in parallel chunks. The calling
  * thread participates. Falls back to a direct call when the pool is
  * unavailable or the range is too small to be worth dispatching. */
-static void j_pool_run(jchunk_fn fn, void *arg, uint32_t n)
+static void j_pool_run_ex(jchunk_fn fn, void *arg, uint32_t n,
+                          uint32_t min_par, uint32_t per_worker)
 {
     if (n == 0)
         return;
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, j_pool_init);
-    if (!j_pool_ready || n < 256) {
+    if (!j_pool_ready || n < min_par) {
         fn(arg, 0, n);
         return;
     }
-    uint32_t target = (uint32_t)(j_pool_nworkers + 1) * 2;
+    uint32_t target = (uint32_t)(j_pool_nworkers + 1) * per_worker;
     uint32_t chunk = (n + target - 1) / target;
     if (chunk == 0) chunk = 1;
 
@@ -173,29 +230,56 @@ static void j_pool_run(jchunk_fn fn, void *arg, uint32_t n)
     pthread_cond_init(&j.finished, 0);
 
     pthread_mutex_lock(&j_pool_mtx);
-    if (j_pool_tail) j_pool_tail->qnext = &j; else j_pool_head = &j;
+    if (j_pool_tail) j_pool_tail->qnext = &j;
+    else atomic_store_explicit(&j_pool_head, &j, memory_order_release);
     j_pool_tail = &j;
+    atomic_fetch_add_explicit(&j_pool_seq, 1, memory_order_release);
     pthread_cond_broadcast(&j_pool_work);
     pthread_mutex_unlock(&j_pool_mtx);
 
     j_drain(&j);
 
+    /* Spin briefly on this job's own atomic counters: the tail chunks
+     * usually complete within microseconds, and entering the cond
+     * wait costs a futex round-trip even when the broadcast has
+     * already happened. The mutex wait below re-verifies the plain
+     * counters and remains the authority for the unlink. */
+    for (int s = 0; s < J_SPIN_CALLER; s++) {
+        if (atomic_load_explicit(&j.a_done, memory_order_acquire)
+                == j.n_chunks &&
+            atomic_load_explicit(&j.a_active, memory_order_acquire) == 0)
+            break;
+        J_PAUSE();
+    }
     pthread_mutex_lock(&j_pool_mtx);
     while (!(j.done == j.n_chunks && j.active == 0))
         pthread_cond_wait(&j.finished, &j_pool_mtx);
     /* unlink (only safe now: no worker can touch the job any more) */
-    jjob_t **pp = &j_pool_head;
-    while (*pp && *pp != &j) pp = &(*pp)->qnext;
-    if (*pp) *pp = j.qnext;
+    jjob_t *head = atomic_load_explicit(&j_pool_head, memory_order_relaxed);
+    if (head == &j) {
+        atomic_store_explicit(&j_pool_head, j.qnext, memory_order_relaxed);
+    } else {
+        jjob_t *q = head;
+        while (q && q->qnext != &j) q = q->qnext;
+        if (q) q->qnext = j.qnext;
+    }
     if (j_pool_tail == &j) {
         j_pool_tail = 0;
-        for (jjob_t *q = j_pool_head; q; q = q->qnext) j_pool_tail = q;
+        for (jjob_t *q = atomic_load_explicit(&j_pool_head,
+                                              memory_order_relaxed);
+             q; q = q->qnext)
+            j_pool_tail = q;
     }
     /* wake workers parked on the completed head so they move on to
      * whatever is queued behind it */
     pthread_cond_broadcast(&j_pool_work);
     pthread_mutex_unlock(&j_pool_mtx);
     pthread_cond_destroy(&j.finished);
+}
+
+static void j_pool_run(jchunk_fn fn, void *arg, uint32_t n)
+{
+    j_pool_run_ex(fn, arg, n, 256, 2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -761,7 +845,7 @@ static void j_cull_parallel(spu_context *ctx, const u128 *gstate, uint32_t tris)
     }
     j_cull_arg a;
     a.ctx = ctx; a.gstate = gstate; a.decision = decision; a.stash = stash;
-    j_pool_run(j_cull_chunk, &a, tris);
+    j_pool_run_ex(j_cull_chunk, &a, tris, 256, 1);
 
     SPU_ALIGN16 u128 W[128];
     u128 carried = gstate[13];
@@ -831,13 +915,13 @@ void ps3_job187280_compute_native(spu_context *ctx)
                 j_pass_arg a;
                 j_dot_setup(G);
                 a.ctx = ctx; a.gstate = G;
-                j_pool_run(j_dot_chunk, &a, elems);
+                j_pool_run_ex(j_dot_chunk, &a, elems, 128, 1);
             }
         } else if (have_elems) {
             j_pass_arg a;
             j_xform_setup(G);
             a.ctx = ctx; a.gstate = G;
-            j_pool_run(j_xform_chunk, &a, elems);
+            j_pool_run_ex(j_xform_chunk, &a, elems, 128, 1);
         }
         if (cull_on) {
             j_cull_setup(ctx, G);
