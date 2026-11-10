@@ -100,6 +100,12 @@ typedef struct rsx_be_render_state {
     u32 depth_clamp;
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
+    /* Points: SET_POINT_SPRITE_CONTROL (0x1EE8; bit 0 enable, bits 8..15 the
+     * texture units whose coordinates become the position within the point --
+     * 0 when sprites are off), SET_POINT_PARAMS_ENABLE (0x1EE4 bit 0: the
+     * vertex program's o6.x is the size) and SET_POINT_SIZE (0x1EE0, float
+     * bits: the size otherwise). Only a POINTS draw reads them. */
+    u32 point_sprite, point_params, point_size_raw;
 } rsx_be_render_state;
 
 /* submit_and_wait reasons, for a backend that wants to log or count them. */
