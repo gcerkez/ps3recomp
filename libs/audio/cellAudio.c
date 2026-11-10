@@ -183,7 +183,21 @@ static int audio_backend_init(void)
     want.freq     = CELL_AUDIO_SAMPLE_RATE;
     want.format   = AUDIO_F32SYS;
     want.channels = 2;
-    want.samples  = CELL_AUDIO_BLOCK_SAMPLES;
+    /* The device's buffer size. SDL hands it to PulseAudio as the stream's
+     * whole target latency (tlength) and to PipeWire as the node's latency,
+     * so one block (256 frames, 5.3 ms) leaves the server only 5.3 ms to
+     * cover any late write: crackle on a busy desktop. Soulbrandt measured
+     * their stream running short 12-14% of the time at 256 frames on a
+     * PipeWire desktop and never at 1024 (bc5540f8). Ask for 1024 frames
+     * (21.3 ms); AUDIO_SDL_FRAMES=<n> overrides, clamped to 256..4096.
+     * Only the device request changes: the mix thread's pacing
+     * (absolute-deadline, drop/resync) stays in charge of timing. */
+    { static int s_frames = -1;
+      if (s_frames < 0) { const char* e = getenv("AUDIO_SDL_FRAMES");
+                          s_frames = e ? atoi(e) : 1024;
+                          if (s_frames < 256) s_frames = 256;
+                          if (s_frames > 4096) s_frames = 4096; }
+      want.samples = (Uint16)s_frames; }
     want.callback = NULL; /* We'll use SDL_QueueAudio */
 
     s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
@@ -444,10 +458,192 @@ static inline float ld_be_f32(const float* p)
     return f;
 }
 
+/* ---------------------------------------------------------------------------
+ * CONCEALMENT PORT (AUDIO_CONCEAL=1; default OFF for this first landing --
+ * default-on is the intended follow-up once listening tests pass)
+ *
+ * Ported, adapted, from whompay/inFAMOUSreborn's vendored cellAudio.c
+ * (v60 elastic consumption, v145 AUDIO_SENTINEL + stall, v145/v147
+ * AUDIO_PLC) -- the same sp00nznet/ps3recomp runtime lineage as this
+ * file, where the same disease was chased for many versions: the guest
+ * audio producer is a frame-driven engine, and under host load it
+ * delivers a block a few ms late. The firmware-style consume-and-clear
+ * then plays that block as a silent hole, and the next good block
+ * restarts with a step -- the audible stutter/crackle. Three
+ * mechanisms, all gated by AUDIO_CONCEAL so the mix is bit-identical
+ * to before when it is unset:
+ *
+ *   - Elastic consumption: before mixing, if a recently-playing port's
+ *     next block is still unwritten and the device queue holds >= 2
+ *     blocks of slack, wait for the producer (bounded, AUDIO_ELASTIC_US,
+ *     default 6000 us) instead of playing the hole.
+ *   - Sentinel + stall: consumed blocks are cleared to -0.0f (raw word
+ *     0x00000080 in the guest buffer's big-endian layout) instead of
+ *     +0.0, so an unwritten block is distinguishable from written
+ *     silence. A port whose block is missing does not advance its read
+ *     index -- the producer loses only the time it is late -- bounded
+ *     by AUDIO_STALL_MAX blocks (default 24 = 128 ms). A producer still
+ *     silent past that is taken as stopped; three such give-ups within
+ *     ~5 s (a producer waiting on +0 clears would deadlock) disable
+ *     the sentinel for the session and restore +0 clears.
+ *   - PLC: a missing block is concealed from the port's last 4
+ *     delivered blocks. AUDIO_PLC_MODE: 3 = WSOLA-style
+ *     waveform-matched block repeat with crossfades (default);
+ *     1 = time-reversed fade; 2 = pitch-period loop, kept for A/B only
+ *     (upstream found it buzzy in fights). AUDIO_PLC=0 turns the
+ *     concealment off (sentinel/stall still apply); AUDIO_SENTINEL=0
+ *     disables the sentinel (missing = the plain all-zero heuristic).
+ *
+ * NOT ported: their host-FIFO clock-paced thread, consumption lag and
+ * eager consumption (thread redesigns belonging to their pacing model,
+ * not ours), and AUDIO_STRETCH (queue-driven WSOLA time-stretch
+ * between the mix and the device): it exists to ride out a slow device
+ * drain, which this fork handles by deadline pacing plus backlog
+ * drop/resync (885b5bab); a stretch stage on that path fights it.
+ * One cosmetic note: with the sentinel on, the AUDIO_PEAK ring map
+ * shows consumed blocks as occupied (the sentinel words are nonzero
+ * when read as host floats).
+ * -----------------------------------------------------------------------*/
+static int audio_conceal_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("AUDIO_CONCEAL"); on = (e && atoi(e)) ? 1 : 0; }
+    return on;
+}
+static int audio_plc_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("AUDIO_PLC"); on = (e && *e == '0') ? 0 : 1; }
+    return audio_conceal_on() && on;
+}
+static int audio_plc_mode(void)
+{
+    static int m = -1;
+    if (m < 0) {
+        const char* e = getenv("AUDIO_PLC_MODE"); m = e ? atoi(e) : 3; if (m < 1 || m > 3) m = 3;
+        fprintf(stderr, "[audio] CONCEALMENT PLC %s, mode %d (%s)\n", audio_plc_on() ? "on" : "OFF", m,
+                m == 3 ? "block repeat + crossfade" : m == 2 ? "pitch loop" : "reverse fade");
+    }
+    return m;
+}
+/* mode 3 gain at t blocks into a gap: 1 for the first 2 blocks, linear fade over the 3rd */
+static inline float plc3_gain(float t) { return t < 2.0f ? 1.0f : (t >= 3.0f ? 0.0f : 3.0f - t); }
+
+#define PLC_HB 4
+static float s_plc_hist[CELL_AUDIO_PORT_MAX][CELL_AUDIO_BLOCK_SAMPLES * 2 * PLC_HB];
+static u32 s_plc_L[CELL_AUDIO_PORT_MAX], s_plc_pos[CELL_AUDIO_PORT_MAX];
+static float s_plc_dc[CELL_AUDIO_PORT_MAX][2];
+static float s_plc_tmp[CELL_AUDIO_BLOCK_SAMPLES * 2];
+static int s_plc_run[CELL_AUDIO_PORT_MAX], s_plc_have[CELL_AUDIO_PORT_MAX];
+static int s_port_recent[CELL_AUDIO_PORT_MAX];
+static int s_stall_run[CELL_AUDIO_PORT_MAX];
+static unsigned long long s_mix_calls;
+static unsigned long long s_n_late_waits, s_n_late_gaps, s_late_wait_us;
+static unsigned long long s_n_plc_conceal, s_n_plc_fadein;
+static unsigned long long s_n_stall, s_n_stall_giveup;
+
+static int s_sent = -1;
+static int audio_sent_on(void)
+{
+    if (!audio_conceal_on()) return 0;
+    if (s_sent < 0) { const char* e = getenv("AUDIO_SENTINEL"); s_sent = (e && *e == '0') ? 0 : 1; }
+    return s_sent;
+}
+static int audio_stall_max(void)
+{
+    static int m = -1;
+    if (m < 0) { const char* e = getenv("AUDIO_STALL_MAX"); m = e ? atoi(e) : 24; if (m < 0) m = 0; }
+    return m;
+}
+static int audio_block_empty(const float* src, u32 nfloats)
+{
+    const u32* w = (const u32*)src;
+    for (u32 i = 0; i < nfloats; i++) if (w[i] & ~0x80u) return 0;   /* -0.0 (the sentinel) is silence too */
+    return 1;
+}
+static int audio_block_unwritten(const float* src, u32 nfloats)
+{
+    const u32* w = (const u32*)src;
+    for (u32 i = 0; i < nfloats; i++) if (w[i] != 0x80u) return 0;
+    return 1;
+}
+/* "the producer has not delivered this block": exact with the sentinel,
+ * else the plain all-zero heuristic */
+static int audio_block_missing(const float* src, u32 nfloats)
+{
+    return audio_sent_on() ? audio_block_unwritten(src, nfloats) : audio_block_empty(src, nfloats);
+}
+static void audio_block_clear(float* src, u32 nfloats)
+{
+    if (audio_sent_on()) { u32* w = (u32*)src; for (u32 i = 0; i < nfloats; i++) w[i] = 0x80u; }
+    else memset(src, 0, nfloats * sizeof(float));
+}
+
+static int audio_ports_late(void)
+{
+    int late = 0;
+    mutex_lock(&s_audio_mutex);
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX && !late; p++) {
+        AudioPortSlot* port = &s_ports[p];
+        if (!port->in_use || !port->running || !port->buffer || s_port_recent[p] <= 0) continue;
+        u32 nch = (u32)port->param.nChannel, nblock = (u32)port->param.nBlock;
+        if (!nblock) continue;
+        const float* src = port->buffer + (u32)(port->read_index % nblock) * CELL_AUDIO_BLOCK_SAMPLES * nch;
+        if (audio_block_missing(src, CELL_AUDIO_BLOCK_SAMPLES * nch)) late = 1;
+    }
+    mutex_unlock(&s_audio_mutex);
+    return late;
+}
+
+static uint64_t audio_conceal_now_us(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER f; LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)((double)c.QuadPart * 1000000.0 / (double)f.QuadPart);
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+#endif
+}
+static long audio_elastic_us(void)
+{
+    static long v = -1;
+    if (v < 0) { const char* e = getenv("AUDIO_ELASTIC_US"); v = e ? atol(e) : 6000; if (v < 0) v = 0; }
+    return v;
+}
+/* v60 elastic consumption, adapted to this fork's mix threads: if a
+ * recently-playing port's next block is unwritten and the device queue
+ * holds at least 2 blocks of slack, wait (bounded) for the producer
+ * instead of mixing a hole. Called once per block by both mix threads;
+ * the pacing resync in each thread absorbs the bounded delay. */
+static void audio_elastic_wait(void)
+{
+    if (!audio_conceal_on()) return;
+    const long budget = audio_elastic_us();
+    if (!budget) return;
+    if (audio_backend_queued_samples() < CELL_AUDIO_BLOCK_SAMPLES * 2) return;
+    if (!audio_ports_late()) return;
+    const uint64_t t0 = audio_conceal_now_us();
+    while (audio_ports_late()) {
+        if (audio_conceal_now_us() - t0 >= (uint64_t)budget) break;
+        if (audio_backend_queued_samples() < CELL_AUDIO_BLOCK_SAMPLES * 2) break;
+#ifdef _WIN32
+        Sleep(1);
+#else
+        usleep(250);
+#endif
+    }
+    s_n_late_waits++;
+    s_late_wait_us += audio_conceal_now_us() - t0;
+}
+
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
 static void audio_mix_one_block(void)
 {
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
+    if (audio_conceal_on()) s_mix_calls++;
 
     mutex_lock(&s_audio_mutex);
 
@@ -483,6 +679,42 @@ static void audio_mix_one_block(void)
         u32 block_idx = (u32)(port->read_index % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
+
+        /* CONCEALMENT: a hole = the port was playing recently but the
+         * block at the read index has not been written yet. Decided
+         * before anything consumes the block. With the sentinel on, a
+         * hole stalls the port (no clear, no read-index advance) until
+         * the producer catches up, bounded by AUDIO_STALL_MAX. */
+        const int conceal = audio_conceal_on();
+        const int blk_empty = conceal ? audio_block_empty(src, CELL_AUDIO_BLOCK_SAMPLES * nch) : 0;
+        const int hole = conceal && s_port_recent[p] > 0 &&
+                         audio_block_missing(src, CELL_AUDIO_BLOCK_SAMPLES * nch);
+        int stall = 0;
+        if (hole && audio_sent_on()) {
+            if (s_stall_run[p] < audio_stall_max()) { stall = 1; s_stall_run[p]++; s_n_stall++; }
+            else {
+                /* Producer silent for the whole stall budget: take it as
+                 * stopped and advance as before. Self-protection (from
+                 * upstream): 3 give-ups within ~5 s of mixes (940 blocks)
+                 * mean a producer is waiting on +0 clears -- sentinel off
+                 * for the session, rings restored to +0. */
+                static unsigned long long s_gu_b0; static int s_gu_n;
+                if (s_mix_calls - s_gu_b0 > 940) { s_gu_b0 = s_mix_calls; s_gu_n = 0; }
+                s_stall_run[p] = 0; s_port_recent[p] = 0; s_n_stall_giveup++;
+                fprintf(stderr, "[audio] CONCEALMENT port %d: producer silent for %d blocks -> advancing\n", p, audio_stall_max());
+                if (++s_gu_n >= 3) {
+                    s_sent = 0;
+                    for (int q = 0; q < CELL_AUDIO_PORT_MAX; q++) {
+                        AudioPortSlot* pq = &s_ports[q];
+                        if (!pq->in_use || !pq->buffer) continue;
+                        u32* w = (u32*)pq->buffer;
+                        const u32 nw = (u32)pq->param.nBlock * CELL_AUDIO_BLOCK_SAMPLES * (u32)pq->param.nChannel;
+                        for (u32 i = 0; i < nw; i++) if (w[i] == 0x80u) w[i] = 0;
+                    }
+                    fprintf(stderr, "[audio] CONCEALMENT sentinel OFF (3 producer give-ups in ~5 s)\n");
+                }
+            }
+        } else if (!hole) s_stall_run[p] = 0;
 
         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
          * vs which block the read cursor is on -- distinguishes "writer never
@@ -536,14 +768,164 @@ static void audio_mix_one_block(void)
                 right += center + lfe + rr + sr;
             }
 
-            s_mix_buffer[s * 2 + 0] += left;
-            s_mix_buffer[s * 2 + 1] += right;
+            if (conceal) {   /* CONCEALMENT: stage per-port; the PLC below decides what plays */
+                s_plc_tmp[s * 2 + 0] = left;
+                s_plc_tmp[s * 2 + 1] = right;
+            } else {
+                s_mix_buffer[s * 2 + 0] += left;
+                s_mix_buffer[s * 2 + 1] += right;
+            }
+        }
+
+        if (conceal) {
+            if (audio_plc_on()) {
+                const int mode = audio_plc_mode();
+                const u32 NS = CELL_AUDIO_BLOCK_SAMPLES, HN = PLC_HB * NS;
+                float* H = s_plc_hist[p];                 /* H[0..HN) frames, H[HN-1] = last frame played */
+                if (hole) {
+                    const int k = s_plc_run[p];
+                    if (mode == 3) {
+                        /* v147 block repeat (see the CONCEALMENT PORT note). */
+                        const u32 TW = 64, XF = 128;
+                        if (k == 0 && s_plc_have[p]) {
+                            double et = 0;
+                            for (u32 i = 0; i < TW; i++) { const float* a = &H[(HN - TW + i) * 2]; et += a[0] * a[0] + a[1] * a[1]; }
+                            float bestc = -2.0f; u32 bestL = HN - TW;
+                            for (u32 Lp = NS + XF; Lp + TW <= HN; Lp++) {
+                                double c = 0, e = 0;
+                                for (u32 i = 0; i < TW; i++) {
+                                    const float* a = &H[(HN - TW + i) * 2]; const float* b = &H[(HN - TW - Lp + i) * 2];
+                                    c += a[0] * b[0] + a[1] * b[1]; e += b[0] * b[0] + b[1] * b[1];
+                                }
+                                const float nc = (e > 1e-12 && et > 1e-12) ? (float)(c / sqrt(e * et)) : 0.0f;
+                                if (nc > bestc) { bestc = nc; bestL = Lp; }
+                            }
+                            s_plc_L[p] = bestL; s_plc_pos[p] = 0;
+                            /* residual step at the join (last played frame vs the frame before the copy): removed
+                             * with a 32-frame decaying offset, so the splice starts without a click */
+                            s_plc_dc[p][0] = H[(HN - 1) * 2 + 0] - H[(HN - bestL - 1) * 2 + 0];
+                            s_plc_dc[p][1] = H[(HN - 1) * 2 + 1] - H[(HN - bestL - 1) * 2 + 1];
+                            s_n_plc_conceal++;
+                        }
+                        if (s_plc_have[p] && s_plc_L[p]) {
+                            const u32 Lp = s_plc_L[p];
+                            for (u32 s = 0; s < NS; s++) {
+                                const u32 pos = s_plc_pos[p] + s;
+                                u32 hsrc = HN - Lp + pos; while (hsrc >= HN) hsrc -= Lp;
+                                const float g = plc3_gain((float)k + (float)s / (float)NS);
+                                float d0 = 0, d1 = 0;
+                                if (pos < 32) { const float w = 1.0f - (float)pos / 32.0f; d0 = s_plc_dc[p][0] * w; d1 = s_plc_dc[p][1] * w; }
+                                s_plc_tmp[s * 2 + 0] = (H[hsrc * 2 + 0] + d0) * g;
+                                s_plc_tmp[s * 2 + 1] = (H[hsrc * 2 + 1] + d1) * g;
+                            }
+                            s_plc_pos[p] += NS;
+                        }
+                    } else if (mode == 2) {
+                        /* v146 pitch-period loop over the last 2 blocks (A/B only; see the CONCEALMENT PORT note) */
+                        if (k == 0 && s_plc_have[p]) {
+                            const u32 TW = 64;
+                            float bestc = -1e30f; u32 bestL = 0;
+                            double et = 0; for (u32 i = 0; i < TW; i++) { const float* a = &H[(HN - TW + i) * 2]; et += a[0] * a[0] + a[1] * a[1]; }
+                            for (u32 Lp = 40; Lp <= 448; Lp++) {
+                                double c = 0, e = 0;
+                                for (u32 i = 0; i < TW; i++) {
+                                    const float* a = &H[(HN - TW + i) * 2]; const float* b = &H[(HN - TW - Lp + i) * 2];
+                                    c += a[0] * b[0] + a[1] * b[1]; e += b[0] * b[0] + b[1] * b[1];
+                                }
+                                const float nc = (e > 1e-12 && et > 1e-12) ? (float)(c / sqrt(e * et)) : 0.0f;
+                                if (nc > bestc) { bestc = nc; bestL = Lp; }
+                            }
+                            if (bestL == 0) bestL = NS;
+                            s_plc_L[p] = bestL; s_plc_pos[p] = 0;
+                            s_n_plc_conceal++;
+                        }
+                        if (s_plc_have[p] && s_plc_L[p]) {
+                            const u32 Lp = s_plc_L[p];
+                            for (u32 s = 0; s < NS; s++) {
+                                const float t = (float)k + (float)s / (float)NS;
+                                const float g = t < 2.0f ? 1.0f : (t >= 6.0f ? 0.0f : 1.0f - (t - 2.0f) / 4.0f);
+                                const u32 hsrc = HN - Lp + (s_plc_pos[p] % Lp);
+                                s_plc_tmp[s * 2 + 0] = H[hsrc * 2 + 0] * g;
+                                s_plc_tmp[s * 2 + 1] = H[hsrc * 2 + 1] * g;
+                                s_plc_pos[p]++;
+                            }
+                        }
+                    } else {
+                        /* v145: last block time-reversed with a fade to zero, further missing blocks silent */
+                        if (k == 0 && s_plc_have[p]) {
+                            const float* L = &H[(HN - NS) * 2];
+                            for (u32 s = 0; s < NS; s++) {
+                                const float g = 1.0f - (float)(s + 1) / (float)NS;
+                                s_plc_tmp[s * 2 + 0] = L[(NS - 1 - s) * 2 + 0] * g;
+                                s_plc_tmp[s * 2 + 1] = L[(NS - 1 - s) * 2 + 1] * g;
+                            }
+                            s_n_plc_conceal++;
+                        }
+                    }
+                    s_plc_run[p]++;
+                } else if (!blk_empty || s_plc_run[p] > 0) {
+                    if (s_plc_run[p] > 0) {
+                        const u32 Lp = s_plc_L[p];
+                        const float t0 = (float)s_plc_run[p];
+                        if (mode == 3) {
+                            const u32 XF = 128;
+                            for (u32 s = 0; s < XF; s++) {
+                                const float a = 0.5f - 0.5f * (float)cos(3.14159265358979 * ((double)s + 0.5) / (double)XF);
+                                float c0 = 0, c1 = 0;
+                                if (s_plc_have[p] && Lp) {
+                                    u32 hsrc = HN - Lp + s_plc_pos[p] + s; while (hsrc >= HN) hsrc -= Lp;
+                                    const float g = plc3_gain(t0 + (float)s / (float)NS);
+                                    c0 = H[hsrc * 2 + 0] * g; c1 = H[hsrc * 2 + 1] * g;
+                                }
+                                s_plc_tmp[s * 2 + 0] = s_plc_tmp[s * 2 + 0] * a + c0 * (1.0f - a);
+                                s_plc_tmp[s * 2 + 1] = s_plc_tmp[s * 2 + 1] * a + c1 * (1.0f - a);
+                            }
+                        } else if (mode == 2) {
+                            const u32 XF = 96;
+                            for (u32 s = 0; s < XF; s++) {
+                                const float a = (float)(s + 1) / (float)(XF + 1);
+                                float c0 = 0, c1 = 0;
+                                if (s_plc_have[p] && Lp) {
+                                    const float t = t0 + (float)s / (float)NS;
+                                    const float g = t < 2.0f ? 1.0f : (t >= 6.0f ? 0.0f : 1.0f - (t - 2.0f) / 4.0f);
+                                    const u32 hsrc = HN - Lp + ((s_plc_pos[p] + s) % Lp);
+                                    c0 = H[hsrc * 2 + 0] * g; c1 = H[hsrc * 2 + 1] * g;
+                                }
+                                s_plc_tmp[s * 2 + 0] = s_plc_tmp[s * 2 + 0] * a + c0 * (1.0f - a);
+                                s_plc_tmp[s * 2 + 1] = s_plc_tmp[s * 2 + 1] * a + c1 * (1.0f - a);
+                            }
+                        } else {
+                            for (u32 s = 0; s < 64; s++) {
+                                const float g = (float)(s + 1) / 64.0f;
+                                s_plc_tmp[s * 2 + 0] *= g; s_plc_tmp[s * 2 + 1] *= g;
+                            }
+                        }
+                        s_n_plc_fadein++;
+                    }
+                    s_plc_run[p] = 0;
+                    memmove(H, H + NS * 2, (HN - NS) * 2 * sizeof(float));   /* history: last PLC_HB delivered blocks */
+                    memcpy(H + (HN - NS) * 2, s_plc_tmp, NS * 2 * sizeof(float));
+                    s_plc_have[p] = 1;
+                }
+            }
+            for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES * 2; s++) s_mix_buffer[s] += s_plc_tmp[s];
+            if (hole) s_n_late_gaps++;
         }
 
         /* Firmware clears a ring-buffer block after consuming it. Besides
          * preventing stale PCM from replaying when a producer stalls, the
          * cleared block is an observable consumption signal for producers. */
-        memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
+        if (stall) continue;   /* CONCEALMENT: keep the block slot and the
+                                * read index -- the producer is only late,
+                                * and the concealed output above covers
+                                * this period. */
+        if (conceal) {
+            if (!blk_empty) s_port_recent[p] = 64;
+            else if (s_port_recent[p] > 0) s_port_recent[p]--;
+            audio_block_clear(src, CELL_AUDIO_BLOCK_SAMPLES * nch);
+        } else {
+            memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
+        }
 
         /* Keep the monotonic counter for tags/timestamps, but publish the
          * ring slot to the guest. SurMixer multiplies this value by the block
@@ -555,10 +937,55 @@ static void audio_mix_one_block(void)
 
     mutex_unlock(&s_audio_mutex);
 
-    /* Clip to [-1.0, 1.0] */
-    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
-        if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
-        if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
+    /* MIX HEADROOM PATCH: fixed master headroom, modelled on
+     * iopenmohaa-ps3's PS3A_MIX_HEADROOM ("reserve 6 dB for overlapping
+     * game sounds", code/client/snd_ps3audio_new.cpp). Our mixer sums
+     * every active port at full level and only meets the rail at the
+     * final clip below, so routine overlaps are squared off even when
+     * nothing is individually loud. Scaling the finished mix by
+     * AUDIO_HEADROOM (default 0.5 = -6 dB) ahead of the
+     * normalise/clip stage keeps ordinary stacking under the rail;
+     * the clip remains as a safety for true peaks, and the opt-in
+     * AUDIO_MIX_NORM stage still runs after this one when enabled.
+     * AUDIO_HEADROOM=1 restores the old full-level mix exactly. */
+    static float s_headroom = -1.0f;
+    if (s_headroom < 0.0f) {
+        const char* e = getenv("AUDIO_HEADROOM");
+        float g = e ? (float)atof(e) : 0.5f;
+        if (!(g > 0.0f) || g > 4.0f) g = 0.5f;
+        s_headroom = g;
+    }
+    if (s_headroom != 1.0f) {
+        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++)
+            s_mix_buffer[i] *= s_headroom;
+    }
+
+    /* Clip to [-1.0, 1.0]. MIX NORM PATCH: with AUDIO_MIX_NORM set,
+     * a block that would clip is scaled uniformly to peak 1.0
+     * instead -- stacked sounds keep their waveform and relative
+     * balance rather than being squared off at the rail. Blocks at
+     * or under full scale are bit-identical either way. */
+    static int s_mix_norm = -1;
+    if (s_mix_norm < 0) {
+        const char* e = getenv("AUDIO_MIX_NORM");
+        s_mix_norm = (e && atoi(e)) ? 1 : 0;
+    }
+    if (s_mix_norm) {
+        float peak = 0.0f;
+        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+            float a = s_mix_buffer[i] < 0.0f ? -s_mix_buffer[i] : s_mix_buffer[i];
+            if (a > peak) peak = a;
+        }
+        if (peak > 1.0f) {
+            float g = 1.0f / peak;
+            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++)
+                s_mix_buffer[i] *= g;
+        }
+    } else {
+        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+            if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
+            if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
+        }
     }
 }
 
@@ -651,6 +1078,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         }
         blocks++;
         /* Mix and submit one block */
+        audio_elastic_wait();   /* CONCEALMENT PORT: no-op unless AUDIO_CONCEAL=1 */
         audio_mix_one_block();
         /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
          * "is any port producing sound" is answerable (LBP Bink movie audio). */
@@ -703,6 +1131,7 @@ static void* audio_mix_thread_func(void* arg)
     const long long block_ns =
         1000000000LL * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE;
     while (s_mix_thread_running) {
+        audio_elastic_wait();   /* CONCEALMENT PORT: no-op unless AUDIO_CONCEAL=1 */
         audio_mix_one_block();
         audio_dump_mix();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
@@ -713,6 +1142,20 @@ static void* audio_mix_thread_func(void* arg)
               const float pk = audio_mix_peak(); if (pk > peak) peak = pk;
               if (++blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", blocks / 188, peak); peak = 0.0f; }
           } }
+
+        /* AUDIO_RATE=1 (POSIX): concealment counters on a ~5 s cadence. */
+        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
+          if (on) { static unsigned long nb;
+            static unsigned long long w0, u0, g0, c0, f0, s0, v0;
+            if (++nb % 940 == 0) {
+                fprintf(stderr, "[audio-rate] conceal %s: late waits %llu (%llu ms), late holes %llu, concealed %llu, fade-ins %llu, stalls %llu, give-ups %llu, sentinel %d\n",
+                        audio_conceal_on() ? "ON" : "off",
+                        s_n_late_waits - w0, (s_late_wait_us - u0) / 1000,
+                        s_n_late_gaps - g0, s_n_plc_conceal - c0, s_n_plc_fadein - f0,
+                        s_n_stall - s0, s_n_stall_giveup - v0, audio_sent_on());
+                w0 = s_n_late_waits; u0 = s_late_wait_us; g0 = s_n_late_gaps;
+                c0 = s_n_plc_conceal; f0 = s_n_plc_fadein; s0 = s_n_stall; v0 = s_n_stall_giveup;
+            } } }
 
         /* Resync instead of playing out a stale backlog: a queue
          * past ~12 blocks (64 ms) or a schedule more than 50 ms

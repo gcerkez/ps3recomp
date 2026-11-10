@@ -196,6 +196,14 @@ typedef struct spu_context {
      * spurs_policy.c memsets and calls the init immediately after; keep it so. */
     SPU_ALIGN16 uint8_t ls_store[SPU_LS_SIZE];
     uint8_t* ls;
+    /* One bit per 4 KB page of local store this context has written since the
+     * bit was last cleared (bit n = LS [n*4K, n*4K+4K)). Every path that
+     * writes LS on behalf of guest code sets it: spu_ls_write128/32, MFC GETs
+     * (single and list elements), the atomic line copy. The SPURS job runner
+     * reads it to re-stage only the pages the previous job touched instead of
+     * re-zeroing and re-copying the whole store (spurs_job.c). Conservative:
+     * a stray set bit only costs a page copy; ~0 means "assume everything". */
+    uint64_t ls_dirty;
 
     /* Program counter (local store address, 0-0x3FFFF) */
     uint32_t pc;
@@ -492,6 +500,17 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 /* ---------------------------------------------------------------------------
  * Local store access helpers
  * -----------------------------------------------------------------------*/
+/* Mark [lsa, lsa+size) written (see spu_context.ls_dirty). size > 0. */
+static inline void spu_ls_mark(spu_context* ctx, uint32_t lsa, uint32_t size)
+{
+    lsa &= SPU_LS_MASK;
+    uint32_t last = lsa + size - 1u;
+    if (last > SPU_LS_MASK) last = SPU_LS_MASK;
+    const uint32_t p0 = lsa >> 12, p1 = last >> 12;
+    ctx->ls_dirty |= (p1 - p0 >= 63u) ? ~0ull
+                   : (((2ull << (p1 - p0)) - 1ull) << p0);
+}
+
 static inline uint8_t* spu_ls_ptr(spu_context* ctx, uint32_t lsa)
 {
     return &ctx->ls[lsa & SPU_LS_MASK];
@@ -508,6 +527,7 @@ static inline uint32_t spu_ls_read32(const spu_context* ctx, uint32_t lsa)
 
 static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 {
+    ctx->ls_dirty |= 1ull << ((lsa & SPU_LS_MASK) >> 12);
     lsa &= SPU_LS_MASK;
     uint8_t* p = &ctx->ls[lsa];
     p[0] = (uint8_t)(val >> 24);
@@ -747,6 +767,7 @@ static SPU_NOINLINE_COLD void spu_ls_write_diag(spu_context* ctx, uint32_t lsa, 
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
+    ctx->ls_dirty |= 1ull << (lsa >> 12);
     uint8_t* p = &ctx->ls[lsa];
 #if defined(__ARM_NEON)
     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */

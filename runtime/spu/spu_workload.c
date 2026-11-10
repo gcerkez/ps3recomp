@@ -1101,6 +1101,9 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
     if (s_prof < 0) { const char* e = ps3_env_once("SPU_JOBPROF"); s_prof = e ? atoi(e) : 0; }
     struct timespec t0, t1;
     if (s_prof) timespec_get(&t0, TIME_UTC);
+    /* One-off dispatch: no resident-binary reuse across it (spurs_job.c). */
+    { extern volatile uint32_t g_spurs_job_bin_epoch;
+      __atomic_fetch_add(&g_spurs_job_bin_epoch, 1u, __ATOMIC_RELEASE); }
     int rc = spu_run_spurs_job(fn, image_id, job_ea, job_desc_size);
     if (s_prof) {
         static double acc[64], last; static unsigned cnt[64];

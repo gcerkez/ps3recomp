@@ -60,6 +60,7 @@ static codec_stream s_streams[CODEC_MAX_STREAMS];
 static void ls_wr32(spu_context *ctx, uint32_t addr, uint32_t v)
 {
     addr &= SPU_LS_MASK;
+    spu_ls_mark(ctx, addr, 4);
     ctx->ls[addr] = (uint8_t)(v >> 24);
     ctx->ls[addr + 1] = (uint8_t)(v >> 16);
     ctx->ls[addr + 2] = (uint8_t)(v >> 8);
@@ -139,6 +140,18 @@ static void codec_tail_push(codec_stream *st, const uint8_t *bytes, int len)
     memcpy(st->tail + st->tail_len, bytes, (size_t)len);
     st->tail_fl[st->tail_nf++] = len;
     st->tail_len += len;
+}
+
+/* SAVESTATE RESET: called by the title glue after a savestate
+ * restore. The stream table is keyed by guest workspace pointer
+ * and a same-format restart is never detected (notes 040); the
+ * restored workspaces belong to the saved timeline, so drop
+ * every stream -- stream_for() re-initialises slots on use. */
+void ps3_spu_mp3_reset_streams(void)
+{
+    memset(s_streams, 0, sizeof s_streams);
+    if (codec_log())
+        fprintf(stderr, "[codec] savestate: stream table reset\n");
 }
 
 int ps3_spu_mp3_pic_invoke(spu_context *ctx, uint32_t entry)

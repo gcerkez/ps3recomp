@@ -1110,6 +1110,12 @@ static unsigned long long gcm_park_grace_ms(void)
 #define GCM_RECYCLE_MARGIN 0x20000u
 static u32 gcm_ea2io(u32 ea);   /* defined with the wrap callback below */
 static u32 s_fifo_getoff  = 0;
+/* SAVESTATE FIFO RESYNC: while set, cellGcm_rsx_process_fifo()
+ * returns without draining. The title glue holds the walker
+ * across a savestate restore and releases it from
+ * ps3_gcm_fifo_savestate_resync() once the walker position
+ * has been moved to the restored guest's position. */
+static volatile int s_fifo_ss_hold = 0;
 /* Backward JUMPs the walker has taken. The ring recycle waits for this to move:
  * it is the walker following the JUMP-to-begin the recycle wrote, i.e. having
  * consumed the whole tail. g_gcm_fifo_drained_ea == begin cannot say that on its
@@ -2327,6 +2333,7 @@ volatile unsigned long g_gcm_drain_tid;
 
 void cellGcm_rsx_process_fifo(void)
 {
+    if (s_fifo_ss_hold) return;   /* SAVESTATE FIFO RESYNC */
     wprof_note_walker();
     g_gcm_drain_tid = GetCurrentThreadId();
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
@@ -4965,4 +4972,111 @@ void cellGcm_syscall_set_fifo(u32 put, u32 get)
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, get);
     s_fifo_getoff  = get;
     s_fifo_calloff = 0;
+}
+
+/* SAVESTATE FIFO RESYNC: the title glue holds the FIFO walker
+ * before a savestate restore replaces guest memory, then calls
+ * the resync once the copy is in. The restore rolls the guest's
+ * GCM context and FIFO ring back to the saved session, whose
+ * host walker had drained to the context's current; this
+ * process's walker still sits at the pre-load session's
+ * position and would drain the restored ring from there --
+ * replaying consumed history or parsing payload data as
+ * methods. Move the walker to the restored position instead:
+ * the one cellGcm_syscall_set_fifo moves it for the driver's
+ * own reset, sourced from the restored guest state. Only
+ * host-private shadow state moves; guest-visible caches
+ * (surfaces, textures, programs) are deliberately untouched. */
+void ps3_gcm_fifo_savestate_hold(void)
+{
+    s_fifo_ss_hold = 1;
+}
+
+void ps3_gcm_fifo_savestate_resync(void)
+{
+    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    /* The restored guest's position is its own context's
+     * current (gCellGcmCurrentContext, the pointer cellGcmInit
+     * handed out -- the same derivation the ring-recycle path
+     * uses), converted to an IO offset. Fall back to the
+     * control register's put if the title never took one. */
+    u32 target = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    if (s_gcm_ctx_out_ea) {
+        const u32 ctx = vm_read32(s_gcm_ctx_out_ea);
+        const u32 cur_ea = ctx ? vm_read32(ctx + 0x8) : 0;
+        const u32 io = cur_ea ? gcm_ea2io(cur_ea) : 0;
+        if (io) target = io;
+    }
+    /* The guest's own put is the restored position BEFORE any
+     * scan-back: the control register keeps publishing it (the
+     * walker chases it), even when the walker itself starts
+     * behind it at the flip marker. */
+    const u32 guest_put = target;
+    /* SAVESTATE FIFO RESYNC (scan back to the last flip
+     * marker): if the saved session's last flip is still
+     * unreached, its marker sits in the tail behind the
+     * restored current. Start the walker AT the marker so the
+     * drain executes it in order -- executing it is what
+     * notes the display buffer, raises the flip-pending flag
+     * the present loop waits on, and counts the reach. The
+     * scan covers two frames' command volume (2x
+     * GCM_FLIP_WRAP_BYTES) and mirrors the walker's marker
+     * test; with no marker in the window the restored current
+     * stands. */
+    if (s_gcm_ctx_out_ea) {
+        const u32 ctx = vm_read32(s_gcm_ctx_out_ea);
+        const u32 begin_ea = ctx ? vm_read32(ctx + 0x0) : 0;
+        const u32 end_ea   = ctx ? vm_read32(ctx + 0x4) : 0;
+        const u32 io_begin = begin_ea ? gcm_ea2io(begin_ea) : 0;
+        const u32 io_end   = end_ea ? gcm_ea2io(end_ea) : 0;
+        if (io_begin && io_end > io_begin) {
+            const u32 ring = io_end - io_begin;
+            u32 scan = 2 * GCM_FLIP_WRAP_BYTES;
+            if (scan > ring) scan = ring;
+            /* First marker found stands: it is the saved
+             * session's last flip. (Starting a frame earlier
+             * was tried and was worse -- the register state a
+             * frame's draws inherit predates the frame, so
+             * replaying it executes more draws under mixed
+             * provenance, not fewer.) */
+            for (u32 back = 4; back <= scan; back += 4) {
+                u32 off = target - back;
+                if (off < io_begin) off += ring;
+                const u32 ea = gcm_io2ea(off);
+                if (!ea) continue;
+                if ((vm_read32(ea) & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
+                    target = off;
+                    break;
+                }
+            }
+        }
+    }
+    fprintf(stderr, "[cellGcmSys] savestate load: FIFO walker "
+            "0x%08X -> 0x%08X (restored guest position)\n",
+            s_fifo_getoff, target);
+    s_fifo_getoff  = target;
+    s_fifo_calloff = 0;
+    s_last_ring_off = target;
+    park_off = 0; park_put = 0;
+    s_sema_blocked_pass = 0; s_park_pass = 0; s_report_hold_pass = 0;
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, guest_put);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, target);
+    g_gcm_fifo_drained_ea = gcm_io2ea(target);
+    /* The restored guest may be waiting on the completion of
+     * the last flip it queued in the saved session: its marker
+     * sits behind the restored current, this walker will never
+     * reach it now, and this session's flip counters never
+     * counted it -- and a flip that is never reached waits
+     * forever (the invariant the skip-scan and the
+     * no-IO-mapping write-off elsewhere in this file state).
+     * Register it as queued AND reached -- a flip completion
+     * owed -- so the tick delivers exactly one completion and
+     * the counters stay consistent for every later flip. If
+     * the saved flip had in fact completed before the save,
+     * the pump's sequence stamp absorbs the extra completion
+     * when no flip is outstanding. */
+    s_fifo_flips_queued++;
+    s_fifo_flips_reached++;
+    s_fifo_ss_hold = 0;
+    ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }

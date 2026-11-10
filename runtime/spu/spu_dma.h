@@ -18,6 +18,7 @@
 #include "spu_context.h"
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h"
+#include "spu_coh_bitmap.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -73,6 +74,63 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
       }
     }
     return 1;
+}
+
+/* Does any 128-byte line in [a0, a1] (both line-aligned, a0 <= a1) carry an
+ * SPU reservation mark? The PUT path used to ask spu_coh_is_reserved -- an
+ * out-of-line call -- once per line, twice per transfer: 256 calls for a
+ * 16 KiB PUT, and the SPU workers' profile in heavy scenes showed it
+ * (comet-crash-re notes 048). The marks are one bit per line in a bitmap, so
+ * the whole span is a byte test at each end and 8-byte words in between.
+ * Same plain loads as spu_coh_line_reserved, so the same visibility rules. */
+static inline int spu_coh_span_any_reserved(uint32_t a0, uint32_t a1)
+{
+    const unsigned char* bits = g_spu_coh_bits;
+    if (!bits) return 0;
+    const uint32_t l0 = a0 >> SPU_COH_LINE_SHIFT, l1 = a1 >> SPU_COH_LINE_SHIFT;
+    const uint32_t b0 = l0 >> 3, b1 = l1 >> 3;
+    const unsigned lo_mask = (0xFFu << (l0 & 7u)) & 0xFFu;
+    const unsigned hi_mask = 0xFFu >> (7u - (l1 & 7u));
+    if (b0 == b1) return (bits[b0] & lo_mask & hi_mask) != 0;
+    if ((bits[b0] & lo_mask) || (bits[b1] & hi_mask)) return 1;
+    uint32_t b = b0 + 1u;
+    for (; b + 8u <= b1; b += 8u) { uint64_t w; memcpy(&w, bits + b, 8); if (w) return 1; }
+    for (; b < b1; b++) if (bits[b]) return 1;
+    return 0;
+}
+
+/* One gate in front of the per-transfer diagnostics.
+ *
+ * mfc_do_transfer and mfc_submit carry ~25 env-armed probes (watches,
+ * histograms, traces). Each tests its own lazily-read static, so with none
+ * armed a transfer still paid ~25 loads and branches before and after a
+ * memcpy that, for the small control DMAs SPURS jobs issue, is only a few
+ * dozen bytes. This reads every one of their env vars once; while none is set
+ * the probe blocks are skipped as a unit. A probe's own gate is unchanged
+ * inside, so arming any one of them behaves exactly as before. */
+static SPU_NOINLINE_COLD inline int mfc_diag_env_scan(void)
+{
+    static const char* const names[] = {
+        "SPU_DMA_WATCH", "SPU_DMA_RANGE", "SPU_DMACHK", "SPU_GETHIST",
+        "SPU_PUTHIST", "SPU_MFC_TRACE", "SPU_STACKEA_WATCH", "SPU_DMATRACE_ALL",
+        "YDKJ_DMA_IMG", "SPU_DUMP_GET", "SPU_OVL_DIAG", "SPU_SMC_WATCH",
+        "SPU_LOCKGUARD", "SPU_CMDHIST", "SPU_WATCHEA", "SPU_WATCHLSA",
+        "SPU_ROWCOV", "SPU_VRAMPC", "SPU_H2LSRC", "SPU_PUTEA", "SPU_DMATRACE",
+        "SPU_DMATRACE_RAW",
+    };
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (getenv(names[i])) return 1;
+    return 0;
+}
+static inline int mfc_diag_armed(void)
+{
+#ifdef SPU_DMA_LOG
+    return 1;   /* compile-time trace inside a gated block */
+#else
+    static int s_armed = -1;
+    if (__builtin_expect(s_armed < 0, 0)) s_armed = mfc_diag_env_scan();
+    return s_armed;
+#endif
 }
 
 /* MFC queue depth */
@@ -203,6 +261,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         spu_lockline_unlock();
         return 0;
     }
+    if (__builtin_expect(mfc_diag_armed(), 0)) {   /* probe block: see mfc_diag_armed */
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
@@ -240,6 +299,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 fprintf(stderr, "[dma-range] %.0f B/s put, %.0f B/s get\n",
                         s_put * 1000.0 / (now - s_t0), s_get * 1000.0 / (now - s_t0));
                 s_put = s_get = 0; s_t0 = now; } } } }
+    }
     /* Malformed transfers are REJECTED, as the hardware MFC does. The rules
      * are the ones the SDK's own dma.h asserts: a non-zero size, at most
      * 16 KB, a multiple of 16 once >= 16 bytes, and LSA/EA sharing 16-byte
@@ -275,6 +335,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                           lsa, (uint32_t)ea, size);
               return 0;
           } } }
+    if (__builtin_expect(mfc_diag_armed(), 0)) {   /* probe block: see mfc_diag_armed */
     /* SPU_DMACHK=1: report transfers that break the MFC rules the guest's own
      * dma.h asserts on -- size 0 or > 16 KB, size not a multiple of 16 for
      * transfers of 16+ bytes, or LSA/EA not sharing 16-byte alignment. */
@@ -400,6 +461,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
                       (uint32_t)ea, size, lsa);
       } }
+    }
     /* Validate size */
     if (size == 0 || size > MFC_MAX_DMA_SIZE)
         return -1;
@@ -441,6 +503,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea; /* PS3 uses 32-bit effective addresses for SPU DMA */
 
+    if (__builtin_expect(mfc_diag_armed(), 0)) {   /* probe block: see mfc_diag_armed */
     /* SPU_STACKEA_WATCH=1: the LBP JobManagerWorker completion protocol hands the
      * SPU job a completion-word EA (param[4]) that lives on the PPU stack
      * (0xD00Cxxxx = VM_STACK_BASE region); the job must DMA a nonzero word there
@@ -485,6 +548,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size, spu->image_id,
                     (uint32_t)spu->pc); }
       } }
+    }
     /* Detect the cri task actually DECODING: a GET of the real video payload
      * (large, from a non-context EA) as opposed to the 64-byte context handshake
      * DMAs. Set a flag the dispatcher polls to know the task got real work. */
@@ -504,6 +568,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      *
      * This is opt-in: it repairs a pointer the guest should have supplied, so
      * it must not mask the real defect by default. */
+    if (__builtin_expect(mfc_diag_armed(), 0)) {   /* probe block: see mfc_diag_armed */
     /* SPU_DUMP_GET=<hexEA>: dump the source bytes the first time an SPU fetches
      * from that address. Fixed BSS structures have the same address in a
      * reference run, so this is what a dump from real hardware diffs against. */
@@ -528,6 +593,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 fflush(stderr);
             }
         }
+    }
     }
     /* The DSP descriptor arrives as a 368-byte GET shortly before the section
      * load; remember where it came from so the substitution below can name it.
@@ -562,11 +628,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             static int _n = 0; if (PS3_LOG_FIRST(_n, 20))
                 fprintf(stderr, "[nulldma] img%u GET ea=0x%08X size=%u -> ZEROED (skipped)\n",
                         spu->image_id, (uint32_t)ea, size);
-            memset(ls_ptr, 0, size);
+            spu_ls_mark(spu, lsa, size); memset(ls_ptr, 0, size);
             return 0;
         }
     }
     if (mfc_is_get(cmd)) {
+        if (__builtin_expect(mfc_diag_armed(), 0)) {   /* probe block: see mfc_diag_armed */
         /* LBP overlay-load diagnosis: a GET of the FMOD overlay descriptor
          * (32B from ~0x94Fxxx) then a large GET from a NULL source = the
          * overlay never loads. Dump the descriptor content to see where the
@@ -595,8 +662,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               lsa, (uint32_t)ea, size, (uint32_t)spu->pc, spu->image_id, "\n");
               }
           } }
+        }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        spu_ls_mark(spu, lsa, size);
+        if (__builtin_expect(mfc_diag_armed(), 0)) {   /* probe block: see mfc_diag_armed */
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
@@ -623,6 +693,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                   fprintf(stderr, "[spu-SMC] img=%d DMA-GET into CODE @0x%05X size=%u ea=0x%08X pc=0x%05X\n",
                           spu->image_id, lsa, size, (uint32_t)ea, (uint32_t)spu->pc & SPU_LS_MASK);
           } }
+        }
         /* Swappable-overlay tracking: a GET from a registered overlay source
          * (by EA or by content signature) marks that overlay's lifted
          * functions resident for this context. */
@@ -630,7 +701,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
         /* SPU_LS_WATCH: a DMA GET landing on a watched LS line is how the PPU
          * delivers commands into the SPU's queue (bypasses spu_ls_write128). */
-        { int _n; unsigned* _w = spu_ls_watch_list(&_n);
+        /* g_spu_ls_watch_n is -1 until the list is first read, 0 when none. */
+        if (__builtin_expect(g_spu_ls_watch_n != 0, 0)) { int _n; unsigned* _w = spu_ls_watch_list(&_n);
           for (int _i = 0; _i < _n; _i++) {
               if (_w[_i] >= lsa && _w[_i] < lsa + size) {
                   const uint8_t* q = &spu->ls[_w[_i] & (SPU_LS_MASK & ~0xFu)];
@@ -679,14 +751,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             extern void spu_lockline_lock(void);
             extern void spu_lockline_unlock(void);
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
-            spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
+            if (__builtin_expect(mfc_diag_armed(), 0))   /* SPU_LOCKGUARD is in the gate */
+                spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
             uint32_t a0 = (uint32_t)ea & ~127u;
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
-            int span_reserved = 0;
-            for (uint32_t a = a0; ; a += 128u) {
-                if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
-                if (a == a1) break;
-            }
+            /* Whole-span bitmap test (spu_coh_span_any_reserved); the per-line
+             * walks below only run when it finds a mark. */
+            int span_reserved = spu_coh_span_any_reserved(a0, a1);
             /* Lines the unlocked pass left for the locked one: a 16 KiB
              * transfer spans at most 129 lines. */
             uint64_t locked_lines[3] = {0, 0, 0};
@@ -724,6 +795,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 spu_lockline_unlock();
             } else {
                 memcpy(ea_ptr, ls_ptr, size);
+                /* Re-check: a line reserved during the copy. Nothing marked in
+                 * the span means nothing to notify; otherwise walk it as before. */
+                if (spu_coh_span_any_reserved(a0, a1))
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
                         spu_lockline_lock();
@@ -1007,6 +1081,7 @@ static inline void spu_dma_repeat_log_end(const spu_context* spu, uint32_t ea, u
 
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
+    if (__builtin_expect(mfc_diag_armed(), 0)) {   /* probe block: see mfc_diag_armed */
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
      * mfc_do_transfer's per-element path. */
@@ -1019,12 +1094,14 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                   if (h[c][im]) fprintf(stderr, "   cmd=0x%02X img=%d  %llu%c",
                                         c, im, h[c][im], 10);
           } } }
+    }
     uint32_t lsa  = spu->mfc_lsa;
     uint64_t ea   = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
     uint32_t size = spu->mfc_size;
     uint32_t tag  = spu->mfc_tag & 0x1F;
     int rc = 0;
 
+    if (__builtin_expect(mfc_diag_armed(), 0)) {   /* probe block: see mfc_diag_armed */
     /* SPU_WATCHEA=<hex guest addr>: report every DMA whose destination range
      * covers one word, with the SPU id, its pc and the value the word holds
      * after the transfer.
@@ -1277,6 +1354,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
           }
       } }
 
+    }
     /* cri build (YDKJ_CRI_CHAIN): when the kernel DMA-loads the TASKSET policy
      * module (libsre guest 0x30023680) to LS 0xA00, switch this SPU's image to 23
      * so subsequent indirect branches to 0xA00 resolve lift_tsp (taskset policy)
@@ -1395,6 +1473,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         return 0;
     }
 
+    if (__builtin_expect(mfc_diag_armed(), 0)) {   /* probe block: see mfc_diag_armed */
     /* DMA trace for the cri task (image 22): log each transfer's LS/EA/size so we
      * can see the work-fetch GET (func_000040F0) that precedes the branch-to-0 and
      * whether its source EA holds valid work-queue data. Env SPU_DMATRACE_ALL. */
@@ -1547,6 +1626,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
+    }
     /* Policy-module observation trace: every SPURS PM run's first transfers,
      * always on (policy runs are rare and their DMA pattern is the primary
      * bring-up signal: joblist fetch, job-module loads, output stores). */
@@ -1633,6 +1713,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
           } } }
     }
 
+    if (__builtin_expect(mfc_diag_armed(), 0)) {   /* probe block: see mfc_diag_armed */
     /* After a cri-task GET, dump the bytes it just read (the task context) so we
      * can tell if eaContext holds valid SPURS work data or garbage. */
     {
@@ -1648,6 +1729,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
+    }
     /* Mark tag as completed -- EXCEPT a list parked at a stall-and-notify
      * element: its tag group stays incomplete until MFC_WrListStallAck resumes
      * it to the end (mfc_list_stall_ack marks completion then). */

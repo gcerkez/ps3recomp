@@ -99,6 +99,24 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
+/* SAVESTATE RESYNC: PAD_FILE/PAD_FILE2 injected-hold state lives
+ * at file scope so ps3_pad_resync_savestate() can clear it. */
+static unsigned s_pf_held_mask = 0; static int s_pf_held_n = 0;
+static unsigned s_pf2_s_pf_held_mask = 0; static int s_pf2_s_pf_held_n = 0;
+
+/* SAVESTATE RESYNC: called by the title glue after a savestate
+ * restore. Drops any in-flight injected holds and marks every
+ * port fresh, so the next cellPadGetData calls admit new
+ * presses exactly as after a poll sweep. */
+void ps3_pad_resync_savestate(void)
+{
+    s_pf_held_mask = 0; s_pf_held_n = 0;
+    s_pf2_s_pf_held_mask = 0; s_pf2_s_pf_held_n = 0;
+    for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++)
+        s_data_fresh[_i] = 1;
+    printf("[cellPad] savestate resync: holds cleared, ports fresh\n");
+    fflush(stdout);
+}
 
 #if PAD_BACKEND_SDL2
 /* PS3 port i's controller, by SDL instance id (-1 = none); the port keeps the
@@ -958,6 +976,27 @@ static void pad_shutdown_backend(void)
  * including one sampling for button-press edges. */
 #define PAD_POLL_INTERVAL_MS 4
 
+/* PAD CADENCE PATCH: the 4 ms cadence is only unobservable for
+ * edge-sampling titles. A title whose input TIMING counts fresh
+ * reports (Comet Crash's menu auto-repeat does) runs that timing
+ * ~4x fast in any state whose loop polls faster than 60 Hz -- its
+ * pause loop polls ~280x/s, so pause menus repeated at ~5 reports
+ * where the front-end menus repeat at ~14. Hardware serves one
+ * fresh report per vblank, so the effective default is now 16 ms.
+ * The PAD_POLL_INTERVAL_MS env var overrides (4 = old behaviour). */
+#define PAD_POLL_INTERVAL_MS_DEFAULT 16
+
+static unsigned long long pad_poll_interval_ms(void)
+{
+    static long s_iv = -1;
+    if (s_iv < 0) {
+        const char* e = getenv("PAD_POLL_INTERVAL_MS");
+        s_iv = e ? strtol(e, 0, 0) : PAD_POLL_INTERVAL_MS_DEFAULT;
+        if (s_iv < 1) s_iv = 1;
+    }
+    return (unsigned long long)s_iv;
+}
+
 static unsigned long long pad_now_ms(void)
 {
 #ifdef _WIN32
@@ -974,7 +1013,7 @@ static void pad_poll_backend(void)
 {
     static unsigned long long s_last_ms = 0;
     unsigned long long now = pad_now_ms();
-    if (s_last_ms && now - s_last_ms < PAD_POLL_INTERVAL_MS) return;
+    if (s_last_ms && now - s_last_ms < pad_poll_interval_ms()) return;
     if (!pad_lock_try()) return;   /* another thread is polling: its result serves this read */
     s_last_ms = now;
     /* A real pad streams reports at roughly this rate whether or not anything
@@ -1251,12 +1290,12 @@ skip_inject: ;
      *                            # long hold; the default is 40)
      */
     { static int s_pf = -1; static char pf_path[512];
-      static unsigned held_mask = 0; static int held_n = 0;
+      /* hold state at file scope: s_pf_held_* -- SAVESTATE RESYNC */
       if (s_pf < 0) { const char* e = getenv("PAD_FILE");
                       s_pf = (e && *e) ? 1 : 0;
                       if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
       if (s_pf && port_no == 0) {
-          if (held_n <= 0) {
+          if (s_pf_held_n <= 0) {
               FILE* f = fopen(pf_path, "rb");
               if (f) {
                   char buf[64]; buf[0] = 0;
@@ -1264,17 +1303,17 @@ skip_inject: ;
                       char* rest;
                       unsigned m = (unsigned)strtoul(buf, &rest, 0);
                       int n = (int)strtol(rest, 0, 0);
-                      if (m) { held_mask = m; held_n = n > 0 ? n : 40;
+                      if (m) { s_pf_held_mask = m; s_pf_held_n = n > 0 ? n : 40;
                                printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
                   }
                   fclose(f);
-                  if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
+                  if (s_pf_held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
               }
           }
-          if (held_n > 0) {
-              if (data->len > 0) held_n--;
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
+          if (s_pf_held_n > 0) {
+              if (data->len > 0) s_pf_held_n--;
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(s_pf_held_mask & 0xFF);
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((s_pf_held_mask >> 8) & 0xFF); }
       } }
 
     /* PAD_FILE2=<path> -- the PAD_FILE contract for port 1, so a second
@@ -1282,12 +1321,12 @@ skip_inject: ;
      * and a Ready confirm on pad 2; every other scripted mechanism in
      * this file is port-0 only). Same encoding and admission rules. */
     { static int s_pf2 = -1; static char pf2_path[512];
-      static unsigned held2_mask = 0; static int held2_n = 0;
+      /* hold state at file scope: s_pf2_held_* -- SAVESTATE RESYNC */
       if (s_pf2 < 0) { const char* e = getenv("PAD_FILE2");
                       s_pf2 = (e && *e) ? 1 : 0;
                       if (s_pf2) { strncpy(pf2_path, e, sizeof pf2_path - 1); pf2_path[sizeof pf2_path - 1] = 0; } }
       if (s_pf2 && port_no == 1) {
-          if (held2_n <= 0) {
+          if (s_pf2_s_pf_held_n <= 0) {
               FILE* f = fopen(pf2_path, "rb");
               if (f) {
                   char buf[64]; buf[0] = 0;
@@ -1295,17 +1334,17 @@ skip_inject: ;
                       char* rest;
                       unsigned m = (unsigned)strtoul(buf, &rest, 0);
                       int n = (int)strtol(rest, 0, 0);
-                      if (m) { held2_mask = m; held2_n = n > 0 ? n : 40;
+                      if (m) { s_pf2_s_pf_held_mask = m; s_pf2_s_pf_held_n = n > 0 ? n : 40;
                                printf("[cellPad] PAD_FILE2 press 0x%04X\n", m); fflush(stdout); }
                   }
                   fclose(f);
-                  if (held2_n > 0) { FILE* w = fopen(pf2_path, "wb"); if (w) fclose(w); }
+                  if (s_pf2_s_pf_held_n > 0) { FILE* w = fopen(pf2_path, "wb"); if (w) fclose(w); }
               }
           }
-          if (held2_n > 0) {
-              if (data->len > 0) held2_n--;
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held2_mask & 0xFF);
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held2_mask >> 8) & 0xFF); }
+          if (s_pf2_s_pf_held_n > 0) {
+              if (data->len > 0) s_pf2_s_pf_held_n--;
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(s_pf2_s_pf_held_mask & 0xFF);
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((s_pf2_s_pf_held_mask >> 8) & 0xFF); }
       } }
 
     /* Analog sticks */
@@ -1423,7 +1462,7 @@ emit:
      * Freshness was finalized before input injection above. Hand out one
      * packet per host report and report len = 0 for any read
      * after that until the next one arrives (pad_poll_backend sets the flag when
-     * it actually re-polls, every PAD_POLL_INTERVAL_MS). That is what the
+     * it actually re-polls, every pad_poll_interval_ms()). That is what the
      * hardware does: a pad streams reports at a fixed rate whether or not
      * anything changed, and libpad buffers them.
      *
