@@ -3202,6 +3202,10 @@ static void jl_run_joblist(int slot, u32 jc_ea, u32 ea_jobs, u32 num_jobs,
     int img0 = 0;
     if (ea_bin0 && size_bin0 && ea_bin0 < 0x10000000u)
         spu_workload_resolve_job(vm_base + ea_bin0, size_bin0, &fn0, &img0);
+    /* New binary epoch: workers re-copy a resident job binary once per batch
+     * (runtime/spu/spurs_job.c, spurs_ls_restage). */
+    { extern volatile uint32_t g_spurs_job_bin_epoch;
+      __atomic_fetch_add(&g_spurs_job_bin_epoch, 1u, __ATOMIC_RELEASE); }
 
     static int s_env_threads = -1;
     if (s_env_threads < 0) {

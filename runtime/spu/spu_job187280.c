@@ -931,5 +931,9 @@ void ps3_job187280_compute_native(spu_context *ctx)
                 j_cull_serial(ctx, G);
         }
     }
+    /* The pool's workers stored to this context concurrently, so their
+     * ls_dirty updates may have raced; claim the whole store instead
+     * (runtime/spu/spurs_job.c re-stages it for the next job). */
+    ctx->ls_dirty = ~0ull;
 }
 

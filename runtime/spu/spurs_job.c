@@ -158,11 +158,134 @@ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
 SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
 void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
 
+/* SPU_JOBSTAT=<secs>: jobs run per image and the LS bytes staged for them
+ * (binary copy + inputs), printed every <secs>. One relaxed atomic add per job
+ * when armed; a load and a predictable branch when not. */
+#include <time.h>
+static int spurs_jobstat_secs(void)
+{
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("SPU_JOBSTAT"); s = (e && *e) ? atoi(e) : 0; }
+    return s;
+}
+static unsigned long long s_jobstat_n[64], s_jobstat_bytes[64];
+static void spurs_jobstat_note(int image_id, uint32_t staged)
+{
+    const unsigned k = (unsigned)image_id & 63u;
+    __atomic_fetch_add(&s_jobstat_n[k], 1ull, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&s_jobstat_bytes[k], (unsigned long long)staged, __ATOMIC_RELAXED);
+    static volatile long long s_last = 0;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const long long now = ts.tv_sec;
+    long long last = s_last;
+    if (!last) { __atomic_compare_exchange_n(&s_last, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); return; }
+    if (now - last < spurs_jobstat_secs()) return;
+    if (!__atomic_compare_exchange_n(&s_last, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    const double dt = (double)(now - last);
+    for (unsigned i = 0; i < 64; i++) {
+        unsigned long long n = __atomic_exchange_n(&s_jobstat_n[i], 0ull, __ATOMIC_RELAXED);
+        unsigned long long b = __atomic_exchange_n(&s_jobstat_bytes[i], 0ull, __ATOMIC_RELAXED);
+        if (n) fprintf(stderr, "[jobstat] image=%u jobs/s=%.0f staged=%.1f MB/s avg=%llu B\n",
+                       i, n / dt, b / dt / 1048576.0, b / n);
+    }
+}
+
+/* ---- local-store re-staging for the reused job context --------------------
+ *
+ * Every job used to memset the whole 256 KB local store and memcpy its binary
+ * in. A Comet Crash Battle runs ~230k jobs a second -- the 177 KB entity job
+ * 00188300 ~90k/s and the 74 KB 001B4300 ~100k/s -- so staging was tens of
+ * GB/s of memset and binary copies: 29% of the process's CPU sat in
+ * __memset/__memmove. Scanning the store to find what changed costs as much
+ * again (the buffers are not cache-resident at that rate), so the runner
+ * tracks writes instead. Same-binary A/B on a driven Battle (RX 7900 XTX,
+ * windowless): 75.4 -> 92.7 fps, 5.2 -> 4.4 cores.
+ *
+ * Invariant between jobs on a reused context: every LS page whose bit is
+ * clear in ctx->ls_dirty holds exactly the previous job's binary bytes below
+ * s_tls_bin_size and zero above it. ls_dirty is set by every path that writes
+ * LS for guest code (spu_ls_write128/32, MFC GET, the atomic line copy;
+ * spu_context.h) and by the staging below for the input/cache/descriptor
+ * regions it fills. So the next job need only rewrite dirty pages -- plus,
+ * if its binary differs, the pages either binary covers.
+ *
+ * "Same binary" means same EA and size within one binary epoch
+ * (g_spurs_job_bin_epoch). The JOBLIST runner bumps the epoch per batch, after
+ * it has fingerprinted the batch's binary from guest memory, and the
+ * chain-walker path bumps it per job, so a binary the guest rewrites between
+ * batches is always re-copied. Within a batch the bytes are taken as fixed
+ * (as jm2 itself does: it does not reload a binary that is already resident).
+ *
+ * The staged store is byte-identical to the old memset+memcpy for every job.
+ * SPURS_JOB_VERIFY=1 checks that on every job against guest memory and
+ * reports any page that differs; SPURS_JOB_FULLCOPY=1 restores the full
+ * memset+memcpy. */
+volatile uint32_t g_spurs_job_bin_epoch = 1;
+
+static int spurs_ls_any_nonzero(const uint8_t* p, uint32_t n)
+{
+    uint32_t i = 0;
+    for (; i + 64u <= n; i += 64u) {
+        uint64_t w[8];
+        memcpy(w, p + i, 64);
+        if (w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) return 1;
+    }
+    for (; i < n; i++) if (p[i]) return 1;
+    return 0;
+}
+
+static int spurs_job_env_flag(const char* name)
+{
+    const char* e = getenv(name);
+    return e && *e == '1';
+}
+
+/* Bring ls to: binary [0, size) from src, zero above. `dirty` and the previous
+ * binary (prev_size, reuse) describe what the store holds now. */
+static void spurs_ls_restage(uint8_t* ls, const uint8_t* src, uint32_t size,
+                             uint64_t dirty, uint32_t prev_size, int reuse)
+{
+    enum { PG = 4096u };
+    for (uint32_t pg = 0; pg < SPU_LS_SIZE / PG; pg++) {
+        const uint32_t lo = pg * PG, hi = lo + PG;
+        if (!((dirty >> pg) & 1u)) {
+            if (reuse) continue;                         /* same bytes */
+            if (lo >= size && lo >= prev_size) continue; /* zero, stays zero */
+        }
+        const uint32_t cut = size <= lo ? lo : (size < hi ? size : hi);
+        if (cut > lo) memcpy(ls + lo, src + lo, cut - lo);
+        if (hi > cut) memset(ls + cut, 0, hi - cut);
+    }
+}
+
+/* SPURS_JOB_VERIFY: compare a staged store against the reference. */
+static void spurs_ls_verify(const uint8_t* ls, const uint8_t* src, uint32_t size,
+                            uint32_t job_ea, int image_id)
+{
+    static unsigned long long s_jobs, s_bad;
+    s_jobs++;
+    for (uint32_t lo = 0; lo < SPU_LS_SIZE; lo += 4096u) {
+        const uint32_t hi = lo + 4096u;
+        const uint32_t cut = size <= lo ? lo : (size < hi ? size : hi);
+        int bad = (cut > lo && memcmp(ls + lo, src + lo, cut - lo)) ||
+                  (hi > cut && spurs_ls_any_nonzero(ls + cut, hi - cut));
+        if (bad) {
+            s_bad++;
+            fprintf(stderr, "[spurs-job] VERIFY MISMATCH image=%d job=0x%08X page=0x%05X (%llu bad / %llu jobs)\n",
+                    image_id, job_ea, lo, s_bad, s_jobs);
+        }
+    }
+    if ((s_jobs % 100000ull) == 0)
+        fprintf(stderr, "[spurs-job] VERIFY %llu jobs, %llu bad pages\n", s_jobs, s_bad);
+}
+
 /* Persistent per-host-thread SPU context so job dispatch avoids 1.5 MB/job of
  * calloc + spu_context_init memset + dual 256 KB LS memcpy, and keeps both the
  * indirect-call dispatch cache (dcache_id) and MFC engine slot warm. */
 static SPURS_JOB_TLS spu_context* s_tls_job_ctx;
 static SPURS_JOB_TLS int          s_tls_job_in_use;
+static SPURS_JOB_TLS uint32_t     s_tls_bin_ea, s_tls_bin_size, s_tls_bin_epoch;
+static SPURS_JOB_TLS int          s_tls_bin_valid;   /* invariant above holds */
 
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
@@ -204,10 +327,27 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                              ? ctx->dcache_id : 0;
         void* keep_cv   = ctx->ch_wait_cv;
         void* keep_lock = ctx->ch_wait_lock;
+        const uint64_t dirty = ctx->ls_dirty;
         memset(ctx->gpr, 0, sizeof(ctx->gpr));
-        memset(ctx->ls_store, 0, SPU_LS_SIZE);
+        /* Local store: binary at 0, zero above (see spurs_ls_restage). */
+        { static int s_full = -1, s_verify = -1;
+          if (s_full < 0)   s_full   = spurs_job_env_flag("SPURS_JOB_FULLCOPY");
+          if (s_verify < 0) s_verify = spurs_job_env_flag("SPURS_JOB_VERIFY");
+          const uint32_t epoch = __atomic_load_n(&g_spurs_job_bin_epoch, __ATOMIC_ACQUIRE);
+          const uint8_t* src = vm_base + ea_bin;
+          if (s_full || !s_tls_bin_valid) {
+              memset(ctx->ls_store, 0, SPU_LS_SIZE);
+              memcpy(ctx->ls_store, src, size_bin);
+          } else {
+              const int reuse = s_tls_bin_ea == ea_bin && s_tls_bin_size == size_bin &&
+                                s_tls_bin_epoch == epoch;
+              spurs_ls_restage(ctx->ls_store, src, size_bin, dirty, s_tls_bin_size, reuse);
+          }
+          if (s_verify) spurs_ls_verify(ctx->ls_store, src, size_bin, job_ea, image_id);
+          s_tls_bin_ea = ea_bin; s_tls_bin_size = size_bin; s_tls_bin_epoch = epoch;
+          s_tls_bin_valid = 1; }
         memset((uint8_t*)ctx + offsetof(spu_context, ls), 0,
-               sizeof(*ctx) - offsetof(spu_context, ls));
+               sizeof(*ctx) - offsetof(spu_context, ls));   /* ls_dirty = 0 */
         ctx->ls           = ctx->ls_store;
         ctx->dcache_id    = keep_dcache;
         ctx->ch_wait_cv   = keep_cv;
@@ -222,8 +362,9 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ctx->image_id = image_id;
     uint8_t* ls   = ctx->ls;
 
-    /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
-    memcpy(ls, vm_base + ea_bin, size_bin);
+    /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ----
+     * The reused context was staged above; a fresh one is calloc'd. */
+    if (temp_ctx) memcpy(ls, vm_base + ea_bin, size_bin);
 
     /* ---- regions, following _cellSpursCheckJob's own arithmetic --------- */
     uint32_t p         = ALIGN1024(size_bin);
@@ -248,12 +389,9 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     uint32_t stack_top = p + ss_size;
     p += ss_size;
 
-    /* Zero binary alignment tail + ioBuffer + oBuffer + scratch + stack. */
-    if (!temp_ctx) {
-        uint32_t zero_end = p < SPU_LS_SIZE ? p : SPU_LS_SIZE;
-        if (zero_end > size_bin)
-            memset(ls + size_bin, 0, zero_end - size_bin);
-    }
+    /* Binary alignment tail + ioBuffer + oBuffer + scratch + stack are zero:
+     * the reused context was cleared above, a fresh one is calloc'd, and
+     * nothing has written past the binary yet. */
 
     /* ---- cache-hinted read-only inputs ---------------------------------- */
     uint32_t dma_base   = job_ea + JH_SIZE;          /* input list ... */
@@ -267,9 +405,8 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         if (p + sz > SPU_LS_SIZE) break;
         cache_ls[i] = p;
         memcpy(ls + p, vm_base + eal, sz);
-        uint32_t aligned_sz = ALIGN1024(sz);
-        if (!temp_ctx && aligned_sz > sz && p + aligned_sz <= SPU_LS_SIZE)
-            memset(ls + p + sz, 0, aligned_sz - sz);
+        spu_ls_mark(ctx, p, sz);
+        uint32_t aligned_sz = ALIGN1024(sz);   /* tail already zero (see above) */
         p += aligned_sz;
     }
 
@@ -282,6 +419,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         if (!sz || !eal) continue;
         if (!io_ls || io_cur + sz > SPU_LS_SIZE) break;
         memcpy(ls + io_cur, vm_base + eal, sz);
+        spu_ls_mark(ctx, io_cur, sz);
         io_cur  += (sz + 15u) & ~15u;
         io_used += (sz + 15u) & ~15u;
     }
@@ -299,6 +437,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     if (!temp_ctx)
         memset(ls + ctx_ls, 0, SPU_LS_SIZE - ctx_ls);
     memcpy(ls + desc_ls, vm_base + job_ea, dsz);
+    spu_ls_mark(ctx, ctx_ls, SPU_LS_SIZE - ctx_ls);   /* context + descriptor */
 
     ls32(ls, ctx_ls + JC_IO_BUFFER, io_ls);
     for (int i = 0; i < 4; i++)
@@ -320,6 +459,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * and halted. The lifted code never reads those bytes as data, so overlay
      * the kernel's view: SPU 0, our DMA tag, tracing off. */
     if (jm_iface) {
+        spu_ls_mark(ctx, 0x170, 0x210 + 0x10 - 0x170);   /* kernel-view overlay */
         memset(ls + 0x170, 0, 0x10);
         memset(ls + 0x1C0, 0, 0x10);
         ls32(ls, 0x1C8, g_spurs_job_spu_num);
@@ -441,6 +581,8 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * and trips its parameter guard, which HALTS -- ending the run. So the
      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
      * noise, not a failure: the job's real work finished before the jump. */
+    if (__builtin_expect(spurs_jobstat_secs() != 0, 0))
+        spurs_jobstat_note(image_id, size_bin + io_used);
     spu_run_with_halt(entry, ctx);
 
     /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for

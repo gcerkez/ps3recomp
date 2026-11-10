@@ -60,6 +60,7 @@ static codec_stream s_streams[CODEC_MAX_STREAMS];
 static void ls_wr32(spu_context *ctx, uint32_t addr, uint32_t v)
 {
     addr &= SPU_LS_MASK;
+    spu_ls_mark(ctx, addr, 4);
     ctx->ls[addr] = (uint8_t)(v >> 24);
     ctx->ls[addr + 1] = (uint8_t)(v >> 16);
     ctx->ls[addr + 2] = (uint8_t)(v >> 8);

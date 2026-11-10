@@ -628,7 +628,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             static int _n = 0; if (PS3_LOG_FIRST(_n, 20))
                 fprintf(stderr, "[nulldma] img%u GET ea=0x%08X size=%u -> ZEROED (skipped)\n",
                         spu->image_id, (uint32_t)ea, size);
-            memset(ls_ptr, 0, size);
+            spu_ls_mark(spu, lsa, size); memset(ls_ptr, 0, size);
             return 0;
         }
     }
@@ -665,6 +665,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        spu_ls_mark(spu, lsa, size);
         if (__builtin_expect(mfc_diag_armed(), 0)) {   /* probe block: see mfc_diag_armed */
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */

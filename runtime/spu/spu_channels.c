@@ -653,6 +653,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
+    spu_ls_mark(ctx, lsa, MFC_ATOMIC_LINE);   /* GETLLAR writes the line */
 
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_n = 0; static uint32_t s_lastea = 0;
@@ -2799,7 +2800,7 @@ void spu_indirect_branch(spu_context* ctx)
              * entry, and jobs that ran since may have overwritten it. */
             { const uint32_t sp = ((uint32_t)ctx->ls[0x1C4] << 24) | ((uint32_t)ctx->ls[0x1C5] << 16) |
                                   ((uint32_t)ctx->ls[0x1C6] << 8) | ctx->ls[0x1C7];
-              if (sp) memcpy(ctx->ls + 0x100, vm_base + sp, 0x80); }
+              if (sp) { memcpy(ctx->ls + 0x100, vm_base + sp, 0x80); spu_ls_mark(ctx, 0x100, 0x80); } }
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }
@@ -2845,6 +2846,7 @@ void spu_indirect_branch(spu_context* ctx)
              * the game's real taskset (0x45F1B000) -> policy DMA'd garbage. */
             extern uint32_t g_ydkj_real_taskset_ea;
             uint32_t ts = g_ydkj_real_taskset_ea ? g_ydkj_real_taskset_ea : 0x0F000000u;
+            spu_ls_mark(ctx, 0x27B8, 8);
             ctx->ls[0x27B8]=0x00; ctx->ls[0x27B9]=0x00; ctx->ls[0x27BA]=0x00; ctx->ls[0x27BB]=0x00;
             ctx->ls[0x27BC]=(uint8_t)(ts>>24); ctx->ls[0x27BD]=(uint8_t)(ts>>16); ctx->ls[0x27BE]=(uint8_t)(ts>>8); ctx->ls[0x27BF]=(uint8_t)ts;
             if (ctx->pc == 0xA00u) { static int _n=0; if (PS3_LOG_FIRST(_n, 4))
