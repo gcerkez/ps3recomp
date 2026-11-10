@@ -1051,6 +1051,13 @@ void spu_direct_init(void);
 #  if __has_attribute(musttail)
 #    define SPU_DIRECT_TAILCALLS 1
 #  endif
+#elif defined(__GNUC__) && defined(__has_attribute)
+/* FASTPATH PATCH: GCC >= 15 also provides musttail; without this branch
+ * GCC builds always take the trampoline. Runtime enablement stays
+ * knob-gated in spu_direct_init (PS3_SPU_DIRECT). */
+#  if __has_attribute(musttail)
+#    define SPU_DIRECT_TAILCALLS 1
+#  endif
 #endif
 #ifdef SPU_DIRECT_TAILCALLS
 #define SPU_DIRECT(ctx, PC, FN) do {                                          \
