@@ -373,7 +373,17 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
     static const u8 lanes_b8[4]    = {RSX_REMAP_ONE, 0, 0, 0};
     static const u8 lanes_depth[4] = {0, 0, 0, 0};
     const u32 base = rsx_fmt & 0x9Fu;
-    const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
+    /* PS3RECOMP_G8B8_SWAP=1: the texel's two bytes the other way round.
+     * The upload copies G8B8 byte for byte; if the reference this table
+     * follows (RPCS3's {G,R,G,R}) byte-swaps the 16-bit texel on upload, as
+     * it appears to, this is the matching order. Comet Crash's shadow atlas
+     * only samples right with it (flat squares otherwise); the title enables
+     * it at startup. Off by default until the other titles are checked (the
+     * LBP font atlas only proved that G8B8 text renders, not the order). */
+    static const u8 lanes_g8b8_swap[4] = {0, 1, 0, 1};
+    static int g8b8_swap = -1;
+    if (g8b8_swap < 0) { const char* e = getenv("PS3RECOMP_G8B8_SWAP"); g8b8_swap = e && atoi(e) == 1; }
+    const u8* src2res = (base == 0x8Bu) ? (g8b8_swap ? lanes_g8b8_swap : lanes_g8b8)
                       : (base == 0x81u || base == 0x94u) ? lanes_b8
                       : (base >= 0x90u && base <= 0x93u) ? lanes_depth : lanes_argb;
 

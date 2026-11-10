@@ -2992,6 +2992,7 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
 typedef struct vk_eng_pipe {
     int                 used;
     VkShaderModule      vs, fs;
+    VkShaderModule      fs_pts;          /* point-sprite variant of fs (POINT_LIST only), or null */
     rsx_be_render_state rs;
     u32                 nslots, stride, rt_count;
     VkFormat            rt_fmt;          /* picks the render pass it is built against */
@@ -3203,6 +3204,186 @@ static u32 vk_eng_cube_units(const char* ps_hlsl)
     return mask;
 }
 
+/* ---- points ---------------------------------------------------------------
+ * RSX points take their size from the vertex program's o6.x
+ * (SET_POINT_PARAMS_ENABLE) or SET_POINT_SIZE, and with point sprites on
+ * (SET_POINT_SPRITE_CONTROL) the enabled texture units read the position
+ * within the point instead of their interpolant. Vulkan needs both spelled
+ * out: a vertex shader that does not write PointSize draws points of an
+ * undefined size (1 px in practice) and texcoords stay the single vertex's,
+ * so a particle layer drawn as sprites came out as dots of one texel's
+ * colour (Comet Crash's effects under load). The generated HLSL is patched
+ * here, Vulkan only: the D3D12 and Metal paths share the decompilers. */
+static char s_pt_vs[256 * 1024];
+static char s_pt_ps[256 * 1024];
+
+/* PS3RECOMP_ENG_POINTS=0: draw points as before (no size, no sprites). */
+static int vk_pts_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_POINTS"); on = !(e && *e && atoi(e) == 0); }
+    return on;
+}
+
+static int vk_pts_needed(const rsx_be_render_state* rs)
+{
+    if (!vk_pts_on()) return 0;
+    float sz;
+    memcpy(&sz, &rs->point_size_raw, sizeof sz);
+    return rs->point_params || rs->point_sprite || (sz == sz && sz > 1.0f);
+}
+
+/* Insert `ins` before the "};" that closes the struct opened by `open`. */
+static int vk_pts_struct_insert(char* buf, size_t cap, const char* open, const char* ins)
+{
+    char* st = strstr(buf, open);
+    if (!st) return -1;
+    char* end = strstr(st, "};");
+    if (!end) return -1;
+    const size_t n = strlen(ins), len = strlen(buf);
+    if (len + n + 1 > cap) return -1;
+    memmove(end + n, end, len - (size_t)(end - buf) + 1);
+    memcpy(end, ins, n);
+    return 0;
+}
+
+/* The vertex shader with a PointSize output, or `vs` unchanged when it
+ * cannot be patched (as before: 1 px points). */
+static const char* vk_pts_vs(const char* vs, const rsx_be_render_state* rs)
+{
+    if (!vk_pts_needed(rs) || strlen(vs) + 256 > sizeof s_pt_vs) return vs;
+    snprintf(s_pt_vs, sizeof s_pt_vs, "%s", vs);
+    /* Last member, so the user interpolants keep their locations. */
+    if (vk_pts_struct_insert(s_pt_vs, sizeof s_pt_vs, "struct VSOutput {",
+                             "    [[vk::builtin(\"PointSize\")]] float _rsx_psz:PSIZE;\n")) return vs;
+    char expr[64];
+    float sz;
+    memcpy(&sz, &rs->point_size_raw, sizeof sz);
+    if (!(sz == sz) || sz < 1.0f) sz = 1.0f;
+    if (rs->point_params && strstr(s_pt_vs, "o[6]"))
+        snprintf(expr, sizeof expr, "max(o[6].x, 1.0)");
+    else
+        snprintf(expr, sizeof expr, "%.6g", (double)sz);
+    char* ret = NULL;
+    for (char* q = strstr(s_pt_vs, "return Out;"); q; q = strstr(q + 1, "return Out;")) ret = q;
+    if (!ret) return vs;
+    char assign[96];
+    const int n = snprintf(assign, sizeof assign, "Out._rsx_psz = %s; ", expr);
+    const size_t len = strlen(s_pt_vs);
+    if (n <= 0 || len + (size_t)n + 1 > sizeof s_pt_vs) return vs;
+    memmove(ret + n, ret, len - (size_t)(ret - s_pt_vs) + 1);
+    memcpy(ret, assign, (size_t)n);
+    return s_pt_vs;
+}
+
+/* glslang's HLSL front end has no PointCoord builtin: the input goes in as
+ * an ordinary interpolant and its Location decoration is rewritten in place
+ * to BuiltIn PointCoord (both are 4-word OpDecorate). */
+static int vk_pts_patch_spirv(u32* w, u32 words)
+{
+    if (words < 5) return -1;
+    u32 id = 0;
+    for (u32 i = 5; i < words;) {
+        const u32 wc = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (!wc || i + wc > words) return -1;
+        if (op == 5u && wc >= 3u && strstr((const char*)&w[i + 2], "_rsx_pc")) { id = w[i + 1]; break; }
+        i += wc;
+    }
+    if (!id) return -1;
+    for (u32 i = 5; i < words;) {
+        const u32 wc = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (op == 71u && wc == 4u && w[i + 1] == id && w[i + 2] == 30u) {   /* Decorate id Location n */
+            w[i + 2] = 11u;   /* BuiltIn */
+            w[i + 3] = 16u;   /* PointCoord */
+            return 0;
+        }
+        i += wc;
+    }
+    return -1;
+}
+
+/* The point-sprite fragment variant: units in the sprite mask read
+ * (s, t, 0, 1) of the point. Null when sprites are off or it cannot be built
+ * (the pipeline then draws points with the plain fs, as before). */
+static VkShaderModule vk_pts_fs(const char* ps, const rsx_be_render_state* rs)
+{
+    const u32 mask = (rs->point_sprite >> 8) & 0xFFu;
+    if (!vk_pts_on() || !(rs->point_sprite & 1u) || !mask || strlen(ps) * 2 + 1024 > sizeof s_pt_ps)
+        return VK_NULL_HANDLE;
+    /* Replace the reads first (into s_pt_ps), then add the input member. */
+    size_t o = 0;
+    for (const char* q = ps; *q;) {
+        int hit = 0;
+        if (!strncmp(q, "input.tc", 8) && q[8] >= '0' && q[8] <= '7' && !(q[9] >= '0' && q[9] <= '9')
+            && (mask & (1u << (q[8] - '0')))) {
+            static const char rep[] = "float4(input._rsx_pc, 0.0, 1.0)";
+            if (o + sizeof rep >= sizeof s_pt_ps) return VK_NULL_HANDLE;
+            memcpy(s_pt_ps + o, rep, sizeof rep - 1);
+            o += sizeof rep - 1;
+            q += 9;
+            hit = 1;
+        }
+        if (!hit) {
+            if (o + 2 >= sizeof s_pt_ps) return VK_NULL_HANDLE;
+            s_pt_ps[o++] = *q++;
+        }
+    }
+    s_pt_ps[o] = '\0';
+    if (vk_pts_struct_insert(s_pt_ps, sizeof s_pt_ps, "struct PSInput {", "    float2 _rsx_pc:PCOORD;\n"))
+        return VK_NULL_HANDLE;
+    {   /* PS3RECOMP_ENG_POINTS_DEBUG=1: output the point coordinate (diagnostic). */
+        const char* dbg = getenv("PS3RECOMP_ENG_POINTS_DEBUG");
+        char* m = strstr(s_pt_ps, "float4 main(PSInput input) : SV_TARGET {");
+        if (dbg && atoi(dbg) == 1 && m) {
+            m += strlen("float4 main(PSInput input) : SV_TARGET {");
+            static const char ins[] = " if (input._rsx_pc.x >= 0.0) return float4(input._rsx_pc, 0.5, 1.0);";
+            const size_t len = strlen(s_pt_ps);
+            if (len + sizeof ins < sizeof s_pt_ps) {
+                memmove(m + sizeof ins - 1, m, len - (size_t)(m - s_pt_ps) + 1);
+                memcpy(m, ins, sizeof ins - 1);
+            }
+        }
+    }
+    u32 words = 0;
+    if (rsx_hlsl_to_spirv(s_pt_ps, RSX_SHADER_STAGE_FRAGMENT, s_g.spv, VK_SPV_WORDS, &words,
+                          s_g.log, sizeof s_g.log) || !words) {
+        VK_LOG("engine: point-sprite fragment translation failed: %s\n", s_g.log);
+        return VK_NULL_HANDLE;
+    }
+    if (vk_pts_patch_spirv(s_g.spv, words)) {
+        const char* dd = getenv("PS3RECOMP_ENG_POINTS_DUMP");
+        if (dd && *dd) {
+            static int nd;
+            char path[512];
+            snprintf(path, sizeof path, "%s/pts_fail_%d.hlsl", dd, nd);
+            FILE* f = fopen(path, "w");
+            if (f) { fputs(s_pt_ps, f); fclose(f); }
+            snprintf(path, sizeof path, "%s/pts_fail_%d.spv", dd, nd++);
+            f = fopen(path, "wb");
+            if (f) { fwrite(s_g.spv, 4, words, f); fclose(f); }
+        }
+        /* The program never uses a sprite unit's coordinate (glslang removed
+         * the input): nothing to replace, the plain fs is right. Typically a
+         * triangle pass drawn while the sprite register is still set. */
+        return VK_NULL_HANDLE;
+    }
+    {
+        static unsigned built;
+        if (built++ < 4) VK_LOG("engine: point-sprite fragment variant built (units 0x%02X)\n", mask);
+        const char* dd = getenv("PS3RECOMP_ENG_POINTS_DUMP");
+        if (dd && *dd && built <= 8) {
+            char path[512];
+            snprintf(path, sizeof path, "%s/pts_ok_%u.hlsl", dd, built);
+            FILE* f = fopen(path, "w");
+            if (f) { fputs(s_pt_ps, f); fclose(f); }
+        }
+    }
+    VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                    .codeSize = (size_t)words * 4u, .pCode = s_g.spv };
+    VkShaderModule m = VK_NULL_HANDLE;
+    return pvkCreateShaderModule(s_vk.device, &ci, NULL, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
+}
+
 static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                   const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
                                   u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
@@ -3229,10 +3410,11 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     }
     vk_eng_pipe* P = &s_epipe[slot];
     memset(P, 0, sizeof *P);
-    if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
+    if (vk_eng_translate(vk_pts_vs(vs_hlsl, rs), RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
     if (vk_eng_translate(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs)) {
         pvkDestroyShaderModule(s_vk.device, P->vs, NULL); memset(P, 0, sizeof *P); return 0;
     }
+    P->fs_pts = vk_pts_fs(ps_hlsl, rs);
     P->rs = *rs;
     P->nslots = layout->count;
     P->stride = vertex_stride;
@@ -3253,6 +3435,7 @@ static void vk_eng_pipeline_release(void* user, u32 pipeline)
         if (P->variant[t]) pvkDestroyPipeline(s_vk.device, P->variant[t], NULL);
     if (P->vs) pvkDestroyShaderModule(s_vk.device, P->vs, NULL);
     if (P->fs) pvkDestroyShaderModule(s_vk.device, P->fs, NULL);
+    if (P->fs_pts) pvkDestroyShaderModule(s_vk.device, P->fs_pts, NULL);
     memset(P, 0, sizeof *P);
     if (s_e2.pipeline == pipeline) s_e2.pipeline = 0;
 }
@@ -3274,7 +3457,8 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
           .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = P->vs, .pName = "main" },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = P->fs, .pName = "main" } };
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+          .module = (topo_idx == 0u && P->fs_pts) ? P->fs_pts : P->fs, .pName = "main" } };
     VkVertexInputBindingDescription vb = { 0, P->stride, VK_VERTEX_INPUT_RATE_VERTEX };
     VkVertexInputAttributeDescription va[VK_GUEST_ATTRS];
     for (u32 s = 0; s < P->nslots; s++)
@@ -4067,6 +4251,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     /* Per-target colour mask and blend enable (an MRT set's targets B..D
      * have their own); without it every target takes target A's. */
     want.independentBlend = have.independentBlend;
+    /* Points wider than one pixel (RSX point sizes and sprites). */
+    want.largePoints = have.largePoints;
     s_vk.indep_blend_ok = have.independentBlend ? 1 : 0;
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,

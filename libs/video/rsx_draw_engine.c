@@ -26,6 +26,8 @@
 #include <time.h>
 #include "ps3emu/log_first.h"
 
+static void ps_count_draw(rsx_topology topology, u32 n);   /* RSX_PRIM_STATS, below */
+
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
 extern u8* vm_base;
@@ -476,6 +478,12 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
         const u32 z = rsx_dsp_reg(rsx, M_ZMIN_MAX_CONTROL);
         rs->depth_clamp = eng_depth_clamp_on() && ((z & 0xF0u) != 0 || (z & 0x0Fu) == 0);
     }
+    {
+        const u32 sprite = rsx_dsp_reg(rsx, 0x1EE8);
+        rs->point_sprite = (sprite & 1u) ? (sprite & 0xFF01u) : 0u;
+        rs->point_params = rsx_dsp_reg(rsx, 0x1EE4) & 1u;
+        rs->point_size_raw = rsx_dsp_reg(rsx, 0x1EE0);
+    }
 }
 
 u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
@@ -519,6 +527,9 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
     ENG_HASH_FIELD(bs_zpass);
     ENG_HASH_FIELD(depth_bounds_test);
     ENG_HASH_FIELD(depth_clamp);
+    ENG_HASH_FIELD(point_sprite);
+    ENG_HASH_FIELD(point_params);
+    ENG_HASH_FIELD(point_size_raw);
 #undef ENG_HASH_FIELD
     return hash;
 }
@@ -3728,6 +3739,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    ps_count_draw(topology, n_draw);
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
@@ -3861,6 +3873,74 @@ static u32 eng_present_surface(u32 buffer_id)
     return eng_current_surface();
 }
 
+/* RSX_PRIM_STATS=1: once a second, log what the frames were made of -- draws
+ * and vertices per frame by primitive topology, plus the point size and
+ * point-sprite control the guest last set for a point draw. Diagnostic for
+ * effects that degrade under load (e.g. sprites turning into dots): it shows
+ * whether the title switched primitive type, and the frame rate it did it at.
+ * Off by default; one getenv, then a branch per draw. */
+static struct {
+    int on;
+    u64 draws[6], verts[6];
+    u32 frames;
+    u32 point_size, sprite_ctl, point_params;
+    double t0;
+} s_ps = { -1 };
+
+static double ps_now(void)
+{
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static int ps_enabled(void)
+{
+    if (s_ps.on < 0) {
+        const char* e = getenv("RSX_PRIM_STATS");
+        s_ps.on = (e && *e && atoi(e) != 0) ? 1 : 0;
+        s_ps.t0 = ps_now();
+    }
+    return s_ps.on;
+}
+
+static void ps_count_draw(rsx_topology topology, u32 n)
+{
+    if (!ps_enabled() || (u32)topology > 5u) return;
+    s_ps.draws[topology]++;
+    s_ps.verts[topology] += n;
+    if (topology == RSX_TOPOLOGY_POINTS) {
+        s_ps.point_size   = rsx_dsp_reg(&g.rsx, 0x1EE0);
+        s_ps.point_params = rsx_dsp_reg(&g.rsx, 0x1EE4);
+        s_ps.sprite_ctl   = rsx_dsp_reg(&g.rsx, 0x1EE8);
+    }
+}
+
+static void ps_frame(void)
+{
+    if (!ps_enabled()) return;
+    s_ps.frames++;
+    const double now = ps_now(), dt = now - s_ps.t0;
+    if (dt < 1.0) return;
+    const double f = s_ps.frames ? (double)s_ps.frames : 1.0;
+    float psz;
+    memcpy(&psz, &s_ps.point_size, sizeof psz);
+    fprintf(stderr,
+            "[PRIM_STATS] fps=%.1f per-frame draws: points=%.1f lines=%.1f linestrip=%.1f tris=%.1f tristrip=%.1f"
+            " | verts: points=%.0f tris=%.0f tristrip=%.0f | last point: size=%g params=0x%X sprite_ctl=0x%X\n",
+            s_ps.frames / dt,
+            s_ps.draws[RSX_TOPOLOGY_POINTS] / f, s_ps.draws[RSX_TOPOLOGY_LINES] / f,
+            s_ps.draws[RSX_TOPOLOGY_LINE_STRIP] / f, s_ps.draws[RSX_TOPOLOGY_TRIANGLES] / f,
+            s_ps.draws[RSX_TOPOLOGY_TRIANGLE_STRIP] / f,
+            s_ps.verts[RSX_TOPOLOGY_POINTS] / f, s_ps.verts[RSX_TOPOLOGY_TRIANGLES] / f,
+            s_ps.verts[RSX_TOPOLOGY_TRIANGLE_STRIP] / f,
+            (double)psz, s_ps.point_params, s_ps.sprite_ctl);
+    memset(s_ps.draws, 0, sizeof s_ps.draws);
+    memset(s_ps.verts, 0, sizeof s_ps.verts);
+    s_ps.frames = 0;
+    s_ps.t0 = now;
+}
+
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -3888,6 +3968,7 @@ static void eng_present(u32 buffer_id)
     }
     g.be->present(g.be->user, g.surfaces[target].handle);
     g.frames++;
+    ps_frame();
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
 }
