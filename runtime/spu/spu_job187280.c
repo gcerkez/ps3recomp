@@ -899,7 +899,22 @@ typedef struct {
     int mode_transform, have_elems, cull_on;
     uint32_t elems, tris, consumed;
     int inner_par;     /* may a group use the pool itself (only when groups run serially) */
+    /* LS pages the pool's workers may have written (their ls_dirty updates
+     * race), and whether that set is unknown (claim the whole store). */
+    uint64_t dirty_extra;
+    int claim_all;
 } j_job_arg;
+
+/* The ls_dirty bits for [lsa, lsa + size): spu_ls_mark's arithmetic. */
+static uint64_t j_pages(uint32_t lsa, uint32_t size)
+{
+    if (!size) return 0;
+    lsa &= SPU_LS_MASK;
+    uint32_t last = lsa + size - 1u;
+    if (last > SPU_LS_MASK) return ~0ull;   /* wraps: be conservative */
+    const uint32_t p0 = lsa >> 12, p1 = last >> 12;
+    return (p1 - p0 >= 63u) ? ~0ull : (((2ull << (p1 - p0)) - 1ull) << p0);
+}
 
 /* Groups [b, e) of one call: the guest's per-group loop body, unchanged. */
 static void j_groups_chunk(void *varg, uint32_t b, uint32_t e)
@@ -1011,6 +1026,16 @@ static int j_groups_two_phase(j_job_arg *ja)
     if (!t.gsnap || (scratch_bytes && !t.scratch)) { free(t.gsnap); free(t.scratch); return 0; }
     j_pool_run_ex(j_tp_phase1, &t, (uint32_t)ng, 2, 1);
     spu_context *ctx = ja->ctx;
+    /* Phase 1's LS writes (by workers, racing on ls_dirty): each group's
+     * transform output (32 bytes per element from its G[15]) and its 0x52C
+     * quadword copy (16 bytes at G[44]). Everything else is written below,
+     * on this thread, and marks itself. */
+    for (size_t g = 0; g < ng; g++) {
+        const u128 *G = t.gsnap + g * 128;
+        if (ja->have_elems) ja->dirty_extra |= j_pages(G[15]._u32[0], 32u * ja->elems);
+        if (G[58]._u32[0] != 0) ja->dirty_extra |= j_pages(G[44]._u32[0], 16u);
+    }
+    if (ja->cull_on && ja->tris >= 48 && ja->r7 <= 30000) ja->claim_all = 1;   /* parallel cull below */
     for (size_t g = 0; g < ng; g++) {
         u128 *G = t.gsnap + g * 128;
         if (scratch_bytes) {
@@ -1140,6 +1165,8 @@ void ps3_job187280_compute_native(spu_context *ctx)
      * bound, so the count is data-independent. */
     ja.tris     = ja.cull_on ? (uint32_t)(((int64_t)ja.r7 + 2) / 3) : 0;
     ja.consumed = 3u * ja.tris;
+    ja.dirty_extra = 0;
+    ja.claim_all = 0;
 
     /* Groups are independent (each one's state is derived from its index
      * and it writes its own LS ranges), so a call's groups run across the
@@ -1188,20 +1215,32 @@ void ps3_job187280_compute_native(spu_context *ctx)
     }
     const int tp = tp_on && ja.groups >= 2 && ja.mode_transform && ja.have_elems;
     if (jv_on && tp) {
+        ja.claim_all = 1;
         j_verify_groups(&ja);
     } else if (tp && j_groups_two_phase(&ja)) {
         /* done */
     } else if (par) {
+        ja.claim_all = 1;
         ja.inner_par = 0;
         j_pool_run_ex(j_groups_chunk, &ja, (uint32_t)ja.groups, 2, 1);
     } else {
         ja.inner_par = 1;
+        /* A group's own pool use (big transforms, the parallel cull) writes
+         * from workers: claim the store then. A serial call marks itself. */
+        if ((ja.have_elems && ja.elems >= 128) || (ja.cull_on && ja.tris >= 48 && ja.r7 <= 30000))
+            ja.claim_all = 1;
         j_groups_chunk(&ja, 0, (uint32_t)(ja.groups > 0 ? ja.groups : 0));
     }
-    /* The pool's workers stored to this context concurrently, so their
-     * ls_dirty updates may have raced; claim the whole store instead
-     * (runtime/spu/spurs_job.c re-stages it for the next job). */
-    ctx->ls_dirty = ~0ull;
+    /* The pool's workers store to this context concurrently and their
+     * ls_dirty updates may race. When the pages they can write are known
+     * (the two-phase path), add exactly those; otherwise claim the whole
+     * store, as this always used to -- which made runtime/spu/spurs_job.c
+     * re-stage all 256 KB after every call (~5% of the process in a battle).
+     * J187280_DIRTY_ALL=1 restores the old claim. */
+    static int dirty_all = -1;
+    if (dirty_all < 0) { const char *e = getenv("J187280_DIRTY_ALL"); dirty_all = e && atoi(e) == 1; }
+    if (ja.claim_all || dirty_all) ctx->ls_dirty = ~0ull;
+    else ctx->ls_dirty |= ja.dirty_extra;
     if (js_on) {
         const uint64_t now = js_now();
         atomic_fetch_add(&js_ns, now - js_start);
