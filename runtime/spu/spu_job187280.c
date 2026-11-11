@@ -133,6 +133,8 @@ static void j_drain(jjob_t *j)
     }
 }
 
+static int j_spin_worker = J_SPIN_WORKER;
+
 static void *j_worker(void *unused)
 {
     (void)unused;
@@ -169,7 +171,7 @@ static void *j_worker(void *unused)
                                             memory_order_acquire);
         pthread_mutex_unlock(&j_pool_mtx);
         int bumped = 0;
-        for (int s = 0; s < J_SPIN_WORKER; s++) {
+        for (int s = 0; s < j_spin_worker; s++) {
             if (atomic_load_explicit(&j_pool_seq, memory_order_acquire)
                     != seq) {
                 bumped = 1;
@@ -193,6 +195,18 @@ static void j_pool_init(void)
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     int want = (n > 1) ? (int)n - 1 : 0;
     if (want > 15) want = 15;
+    /* J187280_WORKERS / J187280_SPIN: pool size and how long an idle worker
+     * spins (pause iterations) before parking. Tuning experiments. */
+    /* Defaults: 4 workers that spin ~200 us before parking. The job is
+     * called every ~250 us with ~13 us groups, so parked workers (a futex
+     * wake costs tens of us) arrived after the caller had done the work
+     * itself; 15 workers also meant 15 threads waking per submission. */
+    if (want > 4) want = 4;
+    j_spin_worker = 20000;
+    const char *w = getenv("J187280_WORKERS");
+    if (w && atoi(w) > 0) { long mx = (n > 1) ? n - 1 : 0; want = atoi(w) < mx ? atoi(w) : (int)mx; }
+    const char *sp = getenv("J187280_SPIN");
+    if (sp && atoi(sp) > 0) j_spin_worker = atoi(sp);
     int made = 0;
     for (int i = 0; i < want; i++) {
         pthread_t th;
@@ -442,7 +456,9 @@ static void j_dot_setup(u128 *G)
  * G[14] input (+32/element), G[16] 16-byte out (+16), G[15] 32-byte
  * out (+32), G[17] counter (pre-increment value). The guest loop's
  * ceq exit test is subsumed by the caller's element range. */
-static void j_xform_elem(spu_context *ctx, u128 *G)
+/* priv: when non-null, the 16-byte scratch result (normally stored at the
+ * shared LS cursor G[16]) goes here instead -- the two-phase group path. */
+static inline void j_xform_elem_p(spu_context *ctx, u128 *G, u128 *priv)
 {
     G[74] = spu_il(12);
     G[9]  = spu_ls_read128(ctx, G[14]._u32[0] + 0x10);
@@ -511,7 +527,8 @@ static void j_xform_elem(spu_context *ctx, u128 *G)
     G[73] = spu_fa(G[76], G[77]);
     G[67] = spu_fa(G[74], G[75]);
     G[71] = spu_rotqbyi(G[70], 8);
-    spu_ls_write128(ctx, G[16]._u32[0] + 0x0, G[73]);
+    if (priv) *priv = G[73];
+    else spu_ls_write128(ctx, G[16]._u32[0] + 0x0, G[73]);
     G[10] = spu_fa(G[70], G[71]);
     G[16] = spu_ai(G[16], 16);
     G[68] = spu_ls_read128(ctx, G[14]._u32[0] + G[72]._u32[0]);
@@ -532,6 +549,8 @@ static void j_xform_elem(spu_context *ctx, u128 *G)
     spu_ls_write128(ctx, G[15]._u32[0] + 0x10, G[2]);
     G[15] = spu_ai(G[15], 32);
 }
+
+static void j_xform_elem(spu_context *ctx, u128 *G) { j_xform_elem_p(ctx, G, 0); }
 
 /* Guest func_000009A0: one dot-product-pass element. Cursors on entry:
  * G[12] input (+32/element), G[13] 16-byte out (+16), G[14] counter
@@ -932,6 +951,91 @@ static void j_groups_chunk(void *varg, uint32_t b, uint32_t e)
     }
 }
 
+/* Two-phase groups (transform mode). Phase 1, across the pool: each group's
+ * 0x52C copy, compose and transform -- they read shared input and write only
+ * that group's own LS blocks -- with the transform's 16-byte-per-element
+ * scratch (the shared LS area at G[16], which every group overwrites) kept
+ * in a private buffer, plus the group's register state for the cull. Phase
+ * 2, in group order: copy the group's scratch into place, then its cull,
+ * which appends records after the previous group's. The local store ends
+ * exactly as the serial loop leaves it (J187280_VERIFY checks every byte). */
+typedef struct {
+    j_job_arg *ja;
+    u128 *gsnap;       /* groups x 128 registers after the pass setup */
+    u128 *scratch;     /* groups x elems scratch results */
+} j_tp_arg;
+
+static void j_tp_phase1(void *varg, uint32_t b, uint32_t e)
+{
+    const j_tp_arg *t = (const j_tp_arg *)varg;
+    const j_job_arg *ja = t->ja;
+    spu_context *ctx = ja->ctx;
+    const u128 *base = ja->base;
+    for (uint32_t g = b; g < e; g++) {
+        u128 *G = t->gsnap + (size_t)g * 128;
+        memcpy(G, base, 128 * sizeof(u128));
+        for (int i = 0; i < 4; i++) {
+            G[23]._u32[i] += 64u * g;
+            G[44]._u32[i] += 16u * g;
+            G[43]._u32[i] += g * base[27]._u32[i];
+            G[53]._u32[i]  = g * base[27]._u32[i];
+            G[45]._u32[i]  = ja->consumed * g;
+        }
+        if (G[58]._u32[0] != 0) {
+            G[7] = spu_ls_read128(ctx, G[23]._u32[0] + 0x30);
+            spu_ls_write128(ctx, G[44]._u32[0] + 0x0, G[7]);
+        }
+        j_compose(ctx, G);
+        if (ja->have_elems) {
+            j_xform_setup(G);
+            SPU_ALIGN16 u128 X[128];
+            memcpy(X, G, sizeof X);
+            for (int i = 0; i < 4; i++) X[17]._u32[i] = 0;
+            u128 *sc = t->scratch + (size_t)g * ja->elems;
+            for (uint32_t k = 0; k < ja->elems; k++)
+                j_xform_elem_p(ctx, X, &sc[k]);
+        }
+    }
+}
+
+/* 1 when done, 0 when the call is not suitable (caller runs it serially). */
+static int j_groups_two_phase(j_job_arg *ja)
+{
+    if (!ja->mode_transform || ja->groups < 2) return 0;
+    const size_t ng = (size_t)ja->groups;
+    const size_t scratch_bytes = ja->have_elems ? (size_t)ja->elems * 16u : 0;
+    j_tp_arg t;
+    t.ja = ja;
+    t.gsnap = (u128 *)aligned_alloc(16, ng * 128 * sizeof(u128));
+    t.scratch = scratch_bytes ? (u128 *)aligned_alloc(16, ng * scratch_bytes) : 0;
+    if (!t.gsnap || (scratch_bytes && !t.scratch)) { free(t.gsnap); free(t.scratch); return 0; }
+    j_pool_run_ex(j_tp_phase1, &t, (uint32_t)ng, 2, 1);
+    spu_context *ctx = ja->ctx;
+    for (size_t g = 0; g < ng; g++) {
+        u128 *G = t.gsnap + g * 128;
+        if (scratch_bytes) {
+            /* the transform's scratch, exactly where the serial loop leaves it */
+            const uint32_t dst = G[16]._u32[0] & SPU_LS_MASK;
+            const u128 *sc = t.scratch + g * ja->elems;
+            if (dst + scratch_bytes <= SPU_LS_SIZE) {
+                for (uint32_t k = 0; k < ja->elems; k++) spu_ls_write128(ctx, dst + 16u * k, sc[k]);
+            } else {
+                for (uint32_t k = 0; k < ja->elems; k++) spu_ls_write128(ctx, (dst + 16u * k) & SPU_LS_MASK, sc[k]);
+            }
+        }
+        if (ja->cull_on) {
+            j_cull_setup(ctx, G);
+            if (ja->tris >= 48 && ja->r7 <= 30000)
+                j_cull_parallel(ctx, G, ja->tris);
+            else
+                j_cull_serial(ctx, G);
+        }
+    }
+    free(t.gsnap);
+    free(t.scratch);
+    return 1;
+}
+
 /* J187280_VERIFY=1: run the call serially (the reference), then again with
  * its groups in parallel from the same starting LS, and compare every byte. */
 static void j_verify_groups(j_job_arg *ja)
@@ -950,7 +1054,8 @@ static void j_verify_groups(j_job_arg *ja)
     memcpy(ref, ja->ctx->ls, SPU_LS_SIZE);
     memcpy(ja->ctx->ls, pre, SPU_LS_SIZE);
     ja->inner_par = 0;
-    j_pool_run_ex(j_groups_chunk, ja, (uint32_t)ja->groups, 2, 1);
+    if (!j_groups_two_phase(ja))
+        j_groups_chunk(ja, 0, (uint32_t)ja->groups);
     const int same = memcmp(ref, ja->ctx->ls, SPU_LS_SIZE) == 0;
     const uint64_t n = atomic_fetch_add(&vcalls, 1) + 1;
     if (!same) {
@@ -1042,7 +1147,11 @@ void ps3_job187280_compute_native(spu_context *ctx)
      * threshold, so before this almost every call ran serially on one
      * thread -- but see below: it is off by default (J187280_GROUP_PAR=1 turns it on);
      * J187280_VERIFY=1 runs both and compares the whole local store. */
-    static int jp_on = -1, jv_on = -1;
+    static int jp_on = -1, jv_on = -1, tp_on = -1;
+    /* The exact two-phase group path (see j_groups_two_phase): on by default,
+     * J187280_TWOPHASE=0 restores the serial per-group loop. Verified byte-
+     * identical over 60,000+ heavy-battle calls; ~35% less time per call. */
+    if (tp_on < 0) { const char* e = getenv("J187280_TWOPHASE"); tp_on = !(e && *e && atoi(e) == 0); }
     /* OFF by default: groups share an LS scratch area (0x8400..) and append
      * their records one after another, so running them in parallel changes
      * the output (J187280_VERIFY found ~75% of calls differ). Experiment only. */
@@ -1077,8 +1186,11 @@ void ps3_job187280_compute_native(spu_context *ctx)
         ctx->ls_dirty = ~0ull;
         return;
     }
-    if (jv_on && par) {
+    const int tp = tp_on && ja.groups >= 2 && ja.mode_transform && ja.have_elems;
+    if (jv_on && tp) {
         j_verify_groups(&ja);
+    } else if (tp && j_groups_two_phase(&ja)) {
+        /* done */
     } else if (par) {
         ja.inner_par = 0;
         j_pool_run_ex(j_groups_chunk, &ja, (uint32_t)ja.groups, 2, 1);
