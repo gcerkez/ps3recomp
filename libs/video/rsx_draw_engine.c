@@ -50,7 +50,12 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_PIPELINES  8192
 #define ENG_PIPELINE_INDEX 16384u        /* open-addressed key index, 2x the table */
 #define ENG_VP_MEMO        8
-#define ENG_MAX_BATCHES    256
+/* Ranges per BEGIN_END group, after contiguous ranges are merged
+ * (dc_add_batch). Was 256 with no merging: a group is sent as DRAW_ARRAYS /
+ * DRAW_INDEX words of at most 256 vertices each, so anything past 65,536
+ * vertices was silently dropped -- Comet Crash's units vanished (leaving
+ * their shadows) once a few hundred were on screen. */
+#define ENG_MAX_BATCHES    4096
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
 #define ENG_INVALID        0xFFFFFFFFu
 /* Guest textures larger than this are a misdecoded register, not an image;
@@ -2853,14 +2858,33 @@ static void sink_immediate_vertex(void* user, const rsx_dispatch* r)
     dc.n_immediate++;
 }
 
+/* Append a (first, count) range to a group's list. A range that starts where
+ * the previous one ended extends it: the group's ranges are read as one
+ * stream in order (no cut between them), so this is the same draw -- and a
+ * large draw split into 256-vertex words takes one slot, not hundreds. */
+static void dc_add_batch(eng_batch* list, u32* n, u32 first, u32 count)
+{
+    if (*n && list[*n - 1].first + list[*n - 1].count == first) {
+        list[*n - 1].count += count;
+        return;
+    }
+    if (*n >= ENG_MAX_BATCHES) {
+        static unsigned warned;
+        if (warned++ < 4)
+            fprintf(stderr, "[rsx engine] draw group has more than %u separate ranges; the rest are dropped\n",
+                    (unsigned)ENG_MAX_BATCHES);
+        return;
+    }
+    list[*n].first = first;
+    list[*n].count = count;
+    (*n)++;
+}
+
 static void sink_draw_arrays(void* user, const rsx_dispatch* r, u32 first, u32 count)
 {
     (void)user; (void)r;
     dc.n_packets++;
-    if (dc.n_arr >= ENG_MAX_BATCHES) return;
-    dc.arr[dc.n_arr].first = first;
-    dc.arr[dc.n_arr].count = count;
-    dc.n_arr++;
+    dc_add_batch(dc.arr, &dc.n_arr, first, count);
 }
 
 /* INLINE_ARRAY delivers one finished stream rather than a (first, count)
@@ -2887,10 +2911,7 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
 {
     (void)user; (void)r;
     dc.n_packets++;
-    if (dc.n_idx >= ENG_MAX_BATCHES) return;
-    dc.idx[dc.n_idx].first = first;
-    dc.idx[dc.n_idx].count = count;
-    dc.n_idx++;
+    dc_add_batch(dc.idx, &dc.n_idx, first, count);
 }
 
 /* Which texture units this draw binds, and from where: a unit naming a
